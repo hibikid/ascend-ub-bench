@@ -35,6 +35,10 @@
      轮询完成标记并校验落盘数据（不 CPU 直读 GVA——910C/GVA_V4 下 DRAM 池 LVA 是设备侧地址，
      memmove 会段错误），确认后退出。
 
+    动态组模式下 rank0 的 join() 只等自己就返回，rank1 的 DRAM 切片 import 是异步的；
+    rank0 开测前先 wait_peer_ready 握手（小 L2G+G2L 回读直到 peer GVA 可达），
+    避免 rank1 起得晚时第一笔拷贝撞上未映射的 GVA、或 rank1 未启动时糊里糊涂地挂。
+
 运行（两台机器各一个终端）：
   # rank0（默认启动 config store）：
   python3 microbench_sdma_mte.py --rank 0 --url tcp://<rank0-ip>:8570 --nic <rank0-数据面ip>
@@ -135,6 +139,9 @@ def parse_args():
                          "(shape=(N,1,576)); batch throughput is measured on the largest scale only")
     ap.add_argument("--poll-timeout", type=int, default=120,
                     help="rank1 timeout (s) waiting for the done marker from rank0")
+    ap.add_argument("--ready-timeout", type=int, default=120,
+                    help="rank0 timeout (s) waiting for the peer DRAM GVA to become reachable "
+                         "(rank1 joined + imported on this device) before benchmarking")
     ap.add_argument("--extend-lib-path", default=None,
                     help="dir containing libmf_hybm_copy_extend.so, sets MEMFABRIC_HYBRID_EXTEND_LIB_PATH")
     return ap.parse_args()
@@ -388,6 +395,45 @@ def verify_peer_data(pool, my_gva, dtype, nbytes, shape=SHAPE):
     return torch.equal(got, make_pattern(dtype, shape))
 
 
+def wait_peer_ready(pool, peer_gva, timeout):
+    """rank0 join 后等待 peer 的 DRAM GVA 在本机设备上可达（rank1 join+import 完成）。
+
+    BM 组引擎是**动态成员模式**（smem_net_group_engine.cpp：groupSize 按实际 join 数增长，
+    见 UpdateBitmapFromRank / GroupJoin），rank0 的 join() 只等自己就返回，rank1 的 DRAM 切片
+    是异步 hybm_import 进本机设备页表的。若 rank1 起得晚，rank0 一 join 就开测，第一笔
+    copy 会撞上尚未映射的 GVA（拷贝失败/“有时跑会出错”）。这里循环做一次小的
+    L2G 写 + G2L 读回（先后试 SDMA/MTE 两条路径），任一路径成功即说明 GVA 已映射，
+    再开始计时；超时则明确报 peer 未就绪，而不是第一笔拷贝才炸。
+    """
+    probe = (torch.arange(256, dtype=torch.int64, device="npu") % 97).to(torch.int32)
+    readback = torch.empty(256, dtype=torch.int32, device="npu")
+    size = probe.nbytes  # 256 * 4B = 1024 B，64B 整数倍；data_ptr 512B 对齐
+    assert probe.data_ptr() % BLOCK_ALIGN == 0 and readback.data_ptr() % BLOCK_ALIGN == 0
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        for flags in (0, COPY_EXTEND_FLAG):
+            try:
+                if pool.copy(probe.data_ptr(), peer_gva, size, bm.BmCopyType.L2G, flags) != 0:
+                    continue
+                torch_npu.npu.synchronize()
+                if pool.copy(peer_gva, readback.data_ptr(), size, bm.BmCopyType.G2L, flags) != 0:
+                    continue
+                torch_npu.npu.synchronize()
+                if torch.equal(readback, probe):
+                    print(f"[rank {pool.rank_id}] peer GVA 0x{peer_gva:x} reachable "
+                          f"(attempt {attempt}, flags={flags})")
+                    return
+            except Exception:
+                continue
+        time.sleep(0.2)
+    raise RuntimeError(
+        f"[rank {pool.rank_id}] timeout {timeout}s waiting for peer GVA 0x{peer_gva:x} "
+        f"to become reachable; check rank1 is running and has joined "
+        f"(its DRAM slice must be imported on this device)")
+
+
 def run_rank0(args):
     if args.extend_lib_path:
         os.environ["MEMFABRIC_HYBRID_EXTEND_LIB_PATH"] = args.extend_lib_path
@@ -408,6 +454,12 @@ def run_rank0(args):
         peer_rank = (pool.rank_id + 1) % args.world_size
         peer_gva = pool.peer_gva(peer_rank, bm.BmMemType.HOST)
         print(f"[rank {pool.rank_id}] peer_rank={peer_rank}, remote DRAM GVA=0x{peer_gva:x}")
+
+        # 动态组模式下 join() 只等自己就返回，rank1 的 DRAM 切片 import 是异步的；
+        # 先握手等 peer GVA 可达再开测，避免第一笔拷贝撞上尚未映射的 GVA
+        # （rank1 起得晚时“有时跑会出错”、rank1 未启动时在这里就明确超时报错）
+        if args.world_size > 1:
+            wait_peer_ready(pool, peer_gva, args.ready_timeout)
 
         dtype = DTYPES[args.dtype]
         scales = parse_scales(args.scales)

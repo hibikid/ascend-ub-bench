@@ -83,6 +83,7 @@ python3 microbench_sdma_mte.py --rank 0 --world_size 1 --url tcp://127.0.0.1:857
 [rank 0] MTE path lib: /path/to/lib64/libmf_hybm_copy_extend.so
 [rank 0] DRAM pool joined (local=1.00GiB, max=1.00GiB/rank)
 [rank 0] peer_rank=1, remote DRAM GVA=0x...
+[rank 0] peer GVA 0x... reachable (attempt 1, flags=0)
 [rank 0] scales=[64, 128, 256, 512, 1024, 2048], iters=100, batch_size=16 x batch_iters=20 (batch_mode=random, batch_rows=16384, seed=42)
 [rank 0] batch source tensor (16384, 1, 576) nbytes=36.00 MiB, ptr=0x...
 [rank 0] scale (64, 1, 576) nbytes=147456 (0.14 MiB), src ptr=0x...
@@ -136,6 +137,7 @@ rank1 侧：
 | `--local-dram` / `--max-dram` | 1GiB / 1GiB | 每机贡献/上限 DRAM，2MiB 对齐 |
 | `--extend-lib-path` | 环境变量 | 手动指定 `libmf_hybm_copy_extend.so` 目录 |
 | `--poll-timeout` | 120s | rank1 等待完成标记的超时 |
+| `--ready-timeout` | 120s | rank0 开测前等待 peer GVA 可达（rank1 join+import）的超时 |
 
 例如只测 4.5MiB 与 144KiB 两档的单条时延：
 
@@ -169,4 +171,10 @@ python3 microbench_sdma_mte.py --rank 0 --scales 64,2048 --url tcp://<rank0-ip>:
   910C/GVA_V4（A3 超节点）下 DRAM 池是 `HybmVmmBasedSegment`，`gva_to_va` 返回的是设备侧 LVA，
   CPU 进程直读即段错误。当前版本已改为 rank1 通过 G2L 拷贝引擎轮询/校验，无需 CPU 直读 GVA；
 - rank1 等不到完成标记（超时）：确认双机 `--local-dram`/`--max-dram` 一致，且 rank1 的 G2L
-  拷贝通路可用（能读到自己的 DRAM 池）。
+  拷贝通路可用（能读到自己的 DRAM 池）；
+- rank0 打印完 `scale (64, 1, 576)` 报错 / “有时跑会出错”：BM 组引擎是**动态成员模式**，
+  rank0 的 `join()` 只等自己就返回，rank1 的 DRAM 切片 import 是异步的；若 rank1 起得晚，
+  rank0 第一笔拷贝会撞上尚未映射的 GVA。当前版本 rank0 开测前先 `wait_peer_ready` 握手
+  （小 L2G+G2L 回读直到 peer GVA 可达）——rank1 起晚一点会自动等它，rank1 完全没起则
+  在 `--ready-timeout`（默认 120s）后明确报 `waiting for peer GVA ... to become reachable`，
+  不会在第一笔拷贝上莫名失败。正常的双机启动顺序仍是先 rank0、再 rank1。
