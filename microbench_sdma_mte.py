@@ -26,7 +26,10 @@
   1. 单条时延/带宽（每个 scale，每条 方向 x 引擎 组合）：
      单次 copy_data 的端到端耗时（同步调用，内部已 AclrtSynchronizeStream / hStream->Synchronize）
   2. 批量吞吐（只在最大 scale）：copy_data_batch 聚合带宽
-     （广播 src 到 peer DRAM 的 B 个切片 / 从 B 个切片收进 dst）
+     （默认 --batch-mode random：从独立的批量源张量 (batch_rows=16384, 1, 576) 随机取 B 条
+      (1,576) 行，scatter 到 peer 批量区 / 从 peer 批量区 gather 回 scratch；
+      --batch-mode broadcast 则把整张最大 scale 的 src 广播到 peer DRAM 的 B 个连续切片 /
+      从 B 个连续切片收进 dst）
 
 角色：rank0 为驱动方，对 rank1 的 DRAM 池 GVA 执行全部计时；rank1 join 后通过 G2L 拷贝引擎
      轮询完成标记并校验落盘数据（不 CPU 直读 GVA——910C/GVA_V4 下 DRAM 池 LVA 是设备侧地址，
@@ -44,6 +47,7 @@
 import argparse
 import ctypes
 import os
+import random
 import time
 
 import torch
@@ -118,6 +122,14 @@ def parse_args():
                     help="tensors per copy_data_batch call (batch region must fit local DRAM)")
     ap.add_argument("--batch-iters", type=int, default=20, help="batch-copy iterations per measurement")
     ap.add_argument("--batch-warmup", type=int, default=2, help="batch-copy warmup iterations")
+    ap.add_argument("--batch-mode", default="random", choices=["random", "broadcast"],
+                    help="batch copy pattern: 'random' (default) scatters B random (1,576) rows of the "
+                         "dedicated batch-source tensor into the peer batch region; 'broadcast' copies the "
+                         "largest-scale tensor to B consecutive slices")
+    ap.add_argument("--batch-rows", type=int, default=16384,
+                    help="first dim of the dedicated batch-source tensor (batch_rows, 1, 576); random mode "
+                         "samples batch_size (1,576) rows from it")
+    ap.add_argument("--seed", type=int, default=42, help="RNG seed for --batch-mode random row selection")
     ap.add_argument("--scales", default="64,128,256,512,1024,2048",
                     help="comma-separated first-dim values for the single-copy scale sweep "
                          "(shape=(N,1,576)); batch throughput is measured on the largest scale only")
@@ -186,8 +198,12 @@ def time_batch_copy(pool, copy_type, flags, src_addrs, dst_addrs, sizes, count, 
     return (t1 - t0) / iters
 
 
-def bench_one(pool, direction, engine, flags, src, dst, peer_gva, nbytes, args, with_batch=True):
-    """对单个 方向 x 引擎 组合做正确性校验 + 单条时延/带宽；with_batch 时再加批量吞吐。"""
+def bench_one(pool, direction, engine, flags, src, dst, peer_gva, nbytes, args, with_batch=True,
+              batch_src=None):
+    """对单个 方向 x 引擎 组合做正确性校验 + 单条时延/带宽；with_batch 时再加批量吞吐。
+
+    batch_src：random 批量模式专用的批量源张量 (batch_rows, 1, 576)，独立于 scale 扫描的 src。
+    """
     shape = tuple(src.shape)
     row = {"shape": shape, "direction": direction, "engine": engine,
            "latency_us": None, "single_bw_gbs": None, "batch_bw_gbs": None, "error": None}
@@ -219,24 +235,60 @@ def bench_one(pool, direction, engine, flags, src, dst, peer_gva, nbytes, args, 
     if not with_batch:
         return row
 
-    # 3) 批量吞吐：广播 src 到 peer DRAM 的 B 个切片（L2G）/ 从 B 个切片收进 dst（G2L）
+    # 3) 批量吞吐：copy_data_batch 一次搬 B 条 (1,576) 行
+    #    - random（默认）：从独立批量源 batch_src(batch_rows,1,576) 随机取 B 行，scatter 到 peer 批量区 /
+    #      从 peer 批量区 gather 回本地 scratch
+    #    - broadcast：把整张 src 广播到 peer DRAM 的 B 个连续切片 / 从 B 个连续切片收进 dst
     try:
-        src_addrs = [src.data_ptr()] * args.batch_size
-        dst_addrs = [peer_gva + i * nbytes for i in range(args.batch_size)]
-        sizes = [nbytes] * args.batch_size
-        # 先把 peer 的批量区域填上模式（不计时），保证 G2L 读到有效数据
-        for _ in range(args.batch_warmup):
-            assert pool.copy_batch(src_addrs, dst_addrs, sizes, args.batch_size,
-                                   bm.BmCopyType.L2G, flags) == 0, "L2G batch fill failed"
-        if direction == "L2G":
-            avg_b = time_batch_copy(pool, copy_type, flags, src_addrs, dst_addrs, sizes,
-                                    args.batch_size, args.batch_warmup, args.batch_iters)
-        else:
-            g2l_src = [peer_gva + i * nbytes for i in range(args.batch_size)]
-            g2l_dst = [dst.data_ptr()] * args.batch_size
-            avg_b = time_batch_copy(pool, copy_type, flags, g2l_src, g2l_dst, sizes,
-                                    args.batch_size, args.batch_warmup, args.batch_iters)
-        row["batch_bw_gbs"] = (args.batch_size * nbytes) / avg_b / 1e9
+        count = args.batch_size
+        row_b = nbytes // shape[0]            # 单条 (1,576) 行的字节数 = element_size * 576（src 与 batch_src 同 dtype，行字节相同）
+        if args.batch_mode == "random":
+            assert batch_src is not None, "random batch mode requires batch_src"
+            n_rows = batch_src.shape[0]                   # 从 (batch_rows, 1, 576) 的批量源里随机挑
+            rng = random.Random(args.seed)
+            idx = rng.sample(range(n_rows), count)
+            idx_t = torch.tensor(idx, dtype=torch.int64, device="npu")
+            batch_base = peer_gva + nbytes                 # 避开 offset 0（rank1 校验区）与末尾 done marker
+            src_rows = [batch_src.data_ptr() + i * row_b for i in idx]
+            dst_rows = [batch_base + j * row_b for j in range(count)]
+            sizes = [row_b] * count
+            # 1) 正确性：随机行 scatter -> peer 批量区 -> gather 回 scratch -> 与 batch_src.index_select 逐元素相等
+            #    （顺带把 peer 批量区填上随机行的数据，保证 G2L 计时读到有效数据）
+            scratch = torch.empty(count, *shape[1:], dtype=batch_src.dtype, device="npu")
+            assert scratch.data_ptr() % BLOCK_ALIGN == 0, f"scratch not {BLOCK_ALIGN}B aligned"
+            assert pool.copy_batch(src_rows, dst_rows, sizes, count, bm.BmCopyType.L2G, flags) == 0, "random L2G fill"
+            torch_npu.npu.synchronize()
+            got_rows = [scratch.data_ptr() + j * row_b for j in range(count)]
+            assert pool.copy_batch(dst_rows, got_rows, sizes, count, bm.BmCopyType.G2L, flags) == 0, "random G2L gather"
+            torch_npu.npu.synchronize()
+            if not torch.equal(scratch, batch_src.index_select(0, idx_t)):
+                raise RuntimeError("random-row batch round-trip mismatch")
+            # 2) 计时：L2G 从 batch_src 随机行 scatter 到 peer；G2L 从 peer 批量区 gather 回 scratch
+            #    （回写目标固定用 scratch，不污染 src/dst/batch_src，避免破坏后续组合的 step1 回读校验与 rank1 校验）
+            if direction == "L2G":
+                avg_b = time_batch_copy(pool, copy_type, flags, src_rows, dst_rows, sizes,
+                                        count, args.batch_warmup, args.batch_iters)
+            else:
+                avg_b = time_batch_copy(pool, copy_type, flags, dst_rows, got_rows, sizes,
+                                        count, args.batch_warmup, args.batch_iters)
+            row["batch_bw_gbs"] = (count * row_b) / avg_b / 1e9
+        else:  # broadcast
+            src_addrs = [src.data_ptr()] * count
+            dst_addrs = [peer_gva + i * nbytes for i in range(count)]
+            sizes = [nbytes] * count
+            # 先把 peer 的批量区域填上模式（不计时），保证 G2L 读到有效数据
+            for _ in range(args.batch_warmup):
+                assert pool.copy_batch(src_addrs, dst_addrs, sizes, count,
+                                       bm.BmCopyType.L2G, flags) == 0, "L2G batch fill failed"
+            if direction == "L2G":
+                avg_b = time_batch_copy(pool, copy_type, flags, src_addrs, dst_addrs, sizes,
+                                        count, args.batch_warmup, args.batch_iters)
+            else:
+                g2l_src = [peer_gva + i * nbytes for i in range(count)]
+                g2l_dst = [dst.data_ptr()] * count
+                avg_b = time_batch_copy(pool, copy_type, flags, g2l_src, g2l_dst, sizes,
+                                        count, args.batch_warmup, args.batch_iters)
+            row["batch_bw_gbs"] = (count * nbytes) / avg_b / 1e9
     except Exception as e:
         # 单条结果保留，批量降级为 N/A（例如 A5/x86 不支持 BatchCopyExtend）
         row["error"] = f"batch failed: {e}"
@@ -363,12 +415,31 @@ def run_rank0(args):
         largest_nbytes = tensor_nbytes(dtype, shape_for(largest))
 
         # 批量吞吐只在最大 scale 上测；批量区域须给末尾 64B 完成标记留位
-        batch_region = args.batch_size * largest_nbytes
+        batch_row_nbytes = tensor_nbytes(dtype, (1, 576))      # 单条 (1,576) 行的字节数
+        if args.batch_mode == "random":
+            # 随机行模式：从独立的 (batch_rows, 1, 576) 批量源张量里挑 batch_size 行，
+            # 批量区放在 peer_gva + largest_nbytes 之后（不碰 offset 0 的 rank1 校验区）
+            batch_region = largest_nbytes + args.batch_size * batch_row_nbytes
+            assert args.batch_size <= args.batch_rows, "batch-size must be <= --batch-rows for random-row mode"
+        else:
+            batch_region = args.batch_size * largest_nbytes
         assert batch_region <= args.local_dram - DONE_BLOCK_BYTES, \
             f"batch region {batch_region}B exceeds local DRAM {args.local_dram}B minus done-marker block; " \
             f"reduce --batch-size"
         print(f"[rank {pool.rank_id}] scales={scales}, iters={args.iters}, batch_size={args.batch_size} "
-              f"x batch_iters={args.batch_iters}")
+              f"x batch_iters={args.batch_iters} (batch_mode={args.batch_mode}, batch_rows={args.batch_rows}, "
+              f"seed={args.seed})")
+
+        # 随机行批量模式专用的批量源张量 (batch_rows, 1, 576)，独立于 scale 扫描的单条拷贝张量
+        batch_src = None
+        if args.batch_mode == "random":
+            batch_shape = (args.batch_rows, 1, 576)
+            batch_src = make_pattern(dtype, batch_shape)
+            assert batch_src.data_ptr() % BLOCK_ALIGN == 0, "batch_src not 64B aligned"
+            torch_npu.npu.synchronize()
+            print(f"[rank {pool.rank_id}] batch source tensor {batch_shape} "
+                  f"nbytes={tensor_nbytes(dtype, batch_shape) / 1024 / 1024:.2f} MiB, "
+                  f"ptr=0x{batch_src.data_ptr():x}")
 
         rows = []
         for scale in scales:
@@ -385,7 +456,8 @@ def run_rank0(args):
             with_batch = (scale == largest)  # 只有最大 scale 附带批量吞吐
             for direction in DIRECTIONS:
                 for engine, flags in ENGINES:
-                    row = bench_one(pool, direction, engine, flags, src, dst, peer_gva, nbytes, args, with_batch)
+                    row = bench_one(pool, direction, engine, flags, src, dst, peer_gva, nbytes, args,
+                                    with_batch, batch_src)
                     rows.append(row)
                     if row["error"]:
                         print(f"[rank {pool.rank_id}] {shape} {direction}/{engine}: {row['error']}")
@@ -435,6 +507,7 @@ def main():
     assert args.world_size in (1, 2) and args.rank < args.world_size, "invalid rank/world_size"
     assert args.local_dram % (2 << 20) == 0 and args.max_dram % (2 << 20) == 0, "DRAM size must be 2MiB aligned"
     assert args.iters > 0 and args.warmup >= 0 and args.batch_size > 0, "invalid iterations/batch-size"
+    assert args.batch_rows > 0, "batch-rows must be positive"
     try:
         if args.rank == 0:
             run_rank0(args)

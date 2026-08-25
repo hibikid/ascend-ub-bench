@@ -41,8 +41,10 @@ hStream->Synchronize();
 1. **单条时延/带宽（每个 scale，每条 方向 × 引擎 组合）**：`iters` 次 `copy_data` 的平均端到端耗时
    （同步调用，内部已 `AclrtSynchronizeStream` / `hStream->Synchronize`），单位 us；
    带宽 = `nbytes / 单条时延`，单位 GB/s。
-2. **批量吞吐（只在最大 scale）**：`copy_data_batch` 聚合带宽（广播 src 到对端 DRAM 的 `B` 个切片 /
-   从 `B` 个切片收进 dst），单位 GB/s。
+2. **批量吞吐（只在最大 scale）**：`copy_data_batch` 聚合带宽。默认 `--batch-mode random` 从**独立的
+   批量源张量 `(16384, 1, 576)`**（`--batch-rows` 可调）随机取 `B` 条 `(1,576)` 行，scatter 到对端
+   DRAM 批量区 / 从批量区 gather 回本地（`--seed` 固定随机行序）；`--batch-mode broadcast` 则把整张
+   最大 scale 的 src 广播到对端 DRAM 的 `B` 个连续切片 / 从 `B` 个切片收进 dst。单位 GB/s。
 
 ## 前提
 
@@ -53,8 +55,9 @@ hStream->Synchronize();
   SDMA/MTE 才能直接访问。普通 A2/跨机服务器若报 `dram segment does not support sdma` 或 MTE 返回非 0，
   说明当前拓扑不支持直访（会回退 RDMA 路径），本 microbench 会把对应行标成 `N/A`；
 - 双机（各 1 rank / 1 卡）可互通 config store（TCP）与数据面网络；
-- DRAM 池大小 2MiB 对齐，单机贡献的 DRAM 至少能容纳 `batch_size × 最大 scale 的 tensor_nbytes`
-  （还要给末尾 64B 完成标记留位，脚本运行期会断言）。
+- DRAM 池大小 2MiB 对齐，单机贡献的 DRAM 至少能容纳 `最大 scale 的 tensor_nbytes + batch_size × 单行字节`
+  （`random` 模式；`broadcast` 模式为 `batch_size × 最大 scale 的 tensor_nbytes`），
+  还要给末尾 64B 完成标记留位，脚本运行期会断言。
 
 ## 运行（双机各一个终端）
 
@@ -80,7 +83,8 @@ python3 microbench_sdma_mte.py --rank 0 --world_size 1 --url tcp://127.0.0.1:857
 [rank 0] MTE path lib: /path/to/lib64/libmf_hybm_copy_extend.so
 [rank 0] DRAM pool joined (local=1.00GiB, max=1.00GiB/rank)
 [rank 0] peer_rank=1, remote DRAM GVA=0x...
-[rank 0] scales=[64, 128, 256, 512, 1024, 2048], iters=100, batch_size=16 x batch_iters=20
+[rank 0] scales=[64, 128, 256, 512, 1024, 2048], iters=100, batch_size=16 x batch_iters=20 (batch_mode=random, batch_rows=16384, seed=42)
+[rank 0] batch source tensor (16384, 1, 576) nbytes=36.00 MiB, ptr=0x...
 [rank 0] scale (64, 1, 576) nbytes=147456 (0.14 MiB), src ptr=0x...
 [rank 0] scale (128, 1, 576) nbytes=294912 (0.28 MiB), src ptr=0x...
 ...
@@ -125,6 +129,9 @@ rank1 侧：
 | `--scales` | `64,128,256,512,1024,2048` | 单条时延/带宽的 scale 扫描，shape=(N,1,576)；批量吞吐只在最大档测 |
 | `--iters` / `--warmup` | 100 / 10 | 单条时延的测量/预热次数 |
 | `--batch-size` / `--batch-iters` | 16 / 20 | 批量吞吐的每批张量数 / 测量次数 |
+| `--batch-mode` | `random` | 批量拷贝模式：`random` 从独立的 `(batch_rows,1,576)` 批量源张量随机取 B 条 `(1,576)` 行 scatter/gather；`broadcast` 广播整张最大 scale 的 src 到 B 个连续切片 |
+| `--batch-rows` | 16384 | `random` 模式批量源张量的第一维（shape=(batch_rows,1,576)） |
+| `--seed` | 42 | `--batch-mode random` 随机行选择的种子 |
 | `--dtype` | `int32` | 张量 dtype（int8/int16/int32/int64/float16/float32/float64） |
 | `--local-dram` / `--max-dram` | 1GiB / 1GiB | 每机贡献/上限 DRAM，2MiB 对齐 |
 | `--extend-lib-path` | 环境变量 | 手动指定 `libmf_hybm_copy_extend.so` 目录 |
@@ -154,8 +161,10 @@ python3 microbench_sdma_mte.py --rank 0 --scales 64,2048 --url tcp://<rank0-ip>:
   当前拓扑（非 A3 超节点 / A2 跨机）不支持 SDMA/MTE 直访远端 DRAM，数据面会回退 RDMA；
 - 数据校验不过：确认 tensor `nbytes` 和 `data_ptr` 都是 64B 整数倍/对齐（脚本已断言），
   且双机 `--local-dram`/`--max-dram` 一致、都 join 成功；
-- `--batch-size × nbytes > --local-dram`：脚本会报错，调小 `--batch-size` 或调大池大小
-  （还需给末尾 64B 完成标记留位，见运行期断言）；
+- 批量区域超出 `--local-dram`：脚本会报错，调小 `--batch-size` 或调大池大小。批量区域公式：
+  `random` 模式为 `最大 scale 的 nbytes + batch_size × 单行字节`（批量区放在 `peer_gva + nbytes` 之后，
+  不碰 offset 0 的 rank1 校验区；随机行从独立的 `(batch_rows,1,576)` 批量源张量里挑，无需整张落盘），
+  `broadcast` 模式为 `batch_size × 最大 scale 的 nbytes`；均需给末尾 64B 完成标记留位（见运行期断言）；
 - rank1 报 `Segmentation fault`：旧版 rank1 用 `gva_to_va` + `memmove` 直读本机 DRAM 池，在
   910C/GVA_V4（A3 超节点）下 DRAM 池是 `HybmVmmBasedSegment`，`gva_to_va` 返回的是设备侧 LVA，
   CPU 进程直读即段错误。当前版本已改为 rank1 通过 G2L 拷贝引擎轮询/校验，无需 CPU 直读 GVA；
