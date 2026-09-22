@@ -43,8 +43,10 @@ hStream->Synchronize();
    带宽 = `nbytes / 单条时延`，单位 GB/s。
 2. **批量吞吐（只在最大 scale）**：`copy_data_batch` 聚合带宽。默认 `--batch-mode random` 从**独立的
    批量源张量 `(16384, 1, 576)`**（`--batch-rows` 可调）随机取 `B` 条 `(1,576)` 行，scatter 到对端
-   DRAM 批量区 / 从批量区 gather 回本地（`--seed` 固定随机行序）；`--batch-mode broadcast` 则把整张
-   最大 scale 的 src 广播到对端 DRAM 的 `B` 个连续切片 / 从 `B` 个切片收进 dst。单位 GB/s。
+   DRAM 批量区 / 从批量区 gather 回本地（`--seed` 固定随机行序）；`--batch-mode strided` 从同一批量源
+   按固定间隔取 `B` 行（`--step-size` 控制源行间隔，0=连续取 0,1,2,...，1=隔一行取 0,2,4,...），dst
+   保持连续；`--batch-mode broadcast` 则把整张最大 scale 的 src 广播到对端 DRAM 的 `B` 个连续切片 /
+   从 `B` 个切片收进 dst。单位 GB/s。
 
 ## 前提
 
@@ -56,16 +58,23 @@ hStream->Synchronize();
   说明当前拓扑不支持直访（会回退 RDMA 路径），本 microbench 会把对应行标成 `N/A`；
 - 双机（各 1 rank / 1 卡）可互通 config store（TCP）与数据面网络；
 - DRAM 池大小 2MiB 对齐，单机贡献的 DRAM 至少能容纳 `最大 scale 的 tensor_nbytes + batch_size × 单行字节`
-  （`random` 模式；`broadcast` 模式为 `batch_size × 最大 scale 的 tensor_nbytes`），
-  还要给末尾 64B 完成标记留位，脚本运行期会断言。
+  （`random`/`strided` 模式；`broadcast` 模式为 `batch_size × 最大 scale 的 tensor_nbytes`），
+  还要给末尾 64B 握手块留位，脚本运行期会断言。
 
-## 运行（双机各一个终端）
+## 角色与运行
+
+双机下角色是**对称翻转**的，避免"rank0 一 join 就开测、撞上 rank1 切片尚未 import 的 GVA"的竞态：
+
+| 角色 | 启动 | 做什么 |
+|-|-|-|
+| **rank0** | 先启动 | config store host + **纯内存持有方**：建池 join 后循环 sleep，直到 Ctrl+C 退出。不碰 peer GVA、不执行任何拷贝，所以不会因 peer 未就绪而报错 |
+| **rank1** | 后启动 | **benchmark 驱动/计时**：join 后 `send_peer_ready` 循环向 rank0 的 DRAM 池末尾写 READY_MAGIC（写成功 = rank0 切片已 import 进本机设备页表，见常见问题），然后跑全部单条/批量计时 |
 
 ```bash
-# ===== rank0 机器（默认启动 config store server）=====
+# ===== rank0 机器（config store host + 内存持有方，Ctrl+C 退出）=====
 python3 microbench_sdma_mte.py --rank 0 --url tcp://<rank0-ip>:8570 --nic <rank0-数据面ip>
 
-# ===== rank1 机器 =====
+# ===== rank1 机器（benchmark 驱动/计时）=====
 python3 microbench_sdma_mte.py --rank 1 --url tcp://<rank0-ip>:8570 --nic <rank1-数据面ip>
 ```
 
@@ -77,19 +86,31 @@ python3 microbench_sdma_mte.py --rank 1 --url tcp://<rank0-ip>:8570 --nic <rank1
 python3 microbench_sdma_mte.py --rank 0 --world_size 1 --url tcp://127.0.0.1:8570
 ```
 
-## 预期输出（rank0 侧）
+## 预期输出（双机）
+
+rank0（内存持有方）侧：
 
 ```
-[rank 0] MTE path lib: /path/to/lib64/libmf_hybm_copy_extend.so
 [rank 0] DRAM pool joined (local=1.00GiB, max=1.00GiB/rank)
-[rank 0] peer_rank=1, remote DRAM GVA=0x...
-[rank 0] peer GVA 0x... reachable (attempt 1, flags=0)
-[rank 0] scales=[64, 128, 256, 512, 1024, 2048], iters=100, batch_size=16 x batch_iters=20 (batch_mode=random, batch_rows=16384, seed=42)
-[rank 0] batch source tensor (16384, 1, 576) nbytes=36.00 MiB, ptr=0x...
-[rank 0] scale (64, 1, 576) nbytes=147456 (0.14 MiB), src ptr=0x...
-[rank 0] scale (128, 1, 576) nbytes=294912 (0.28 MiB), src ptr=0x...
+[rank 0] holding DRAM pool, Ctrl+C to exit ...
+   ...（一直持有，直到 Ctrl+C）
+[rank 0] Ctrl+C received, exiting
+[rank 0] done.
+```
+
+rank1（benchmark 驱动）侧：
+
+```
+[rank 1] joined, waiting for rank0's DRAM slice to be importable ...
+[rank 1] peer_rank=0, remote DRAM GVA=0x...
+[rank 1] peer handshake sent (attempt ...)
+[rank 1] MTE path lib: /path/to/lib64/libmf_hybm_copy_extend.so
+[rank 1] scales=[64, 128, 256, 512, 1024, 2048], iters=100, batch_size=16 x batch_iters=20 (batch_mode=random, batch_rows=16384, seed=42)
+[rank 1] batch source tensor (16384, 1, 576) nbytes=36.00 MiB, ptr=0x...
+[rank 1] scale (64, 1, 576) nbytes=147456 (0.14 MiB), src ptr=0x...
+[rank 1] scale (128, 1, 576) nbytes=294912 (0.28 MiB), src ptr=0x...
 ...
-[rank 0] scale (2048, 1, 576) nbytes=4718592 (4.50 MiB), src ptr=0x...
+[rank 1] scale (2048, 1, 576) nbytes=4718592 (4.50 MiB), src ptr=0x...
 scale sweep: single-copy latency & bandwidth (dtype=int32)
 shape           direction engine  latency(us)   single-BW(GB/s)
 ----------------------------------------------------------------
@@ -106,22 +127,12 @@ G2L       SDMA   ...
 G2L       MTE    ...
 >> L2G: MTE vs SDMA latency x.xx x, single-BW x.xx x, batch-BW x.xx x
 >> G2L: MTE vs SDMA latency x.xx x, single-BW x.xx x, batch-BW x.xx x
-[rank 0] done.
-```
-
-rank1 侧：
-
-```
-[rank 1] joined, waiting for peer benchmark done marker ...
-[rank 1] done marker received, benchmark on peer finished
-[rank 1] peer data verify OK: rank0's largest-scale tensor landed in my DRAM pool
 [rank 1] done.
 ```
 
-> rank1 通过 **G2L 拷贝引擎**轮询/校验自己的 DRAM 池（拷回 NPU buffer 再比对），
-> **不**用 `gva_to_va` + CPU `memmove` 直读：A3/Ascend 910C + GVA_V4 下 DRAM 池是
-> `HybmVmmBasedSegment`，其 LVA 由驱动保留在设备侧地址空间，CPU 进程直读会段错误
-> （旧版 `HybmConnBasedSegment` 才是 `GVA==HVA` 可直读）。轮询走设备通路，两种段都适用。
+> 所有数据校验都走**设备拷贝通路**（bench_one 对每条 方向×引擎 组合做 L2G 写 → G2L 读回 →
+> 逐元素相等），不用 `gva_to_va` + CPU `memmove` 直读 GVA：A3/Ascend 910C + GVA_V4 下 DRAM 池是
+> `HybmVmmBasedSegment`，其 LVA 由驱动保留在设备侧地址空间，CPU 进程直读会段错误。
 
 ## 常用参数
 
@@ -130,19 +141,19 @@ rank1 侧：
 | `--scales` | `64,128,256,512,1024,2048` | 单条时延/带宽的 scale 扫描，shape=(N,1,576)；批量吞吐只在最大档测 |
 | `--iters` / `--warmup` | 100 / 10 | 单条时延的测量/预热次数 |
 | `--batch-size` / `--batch-iters` | 16 / 20 | 批量吞吐的每批张量数 / 测量次数 |
-| `--batch-mode` | `random` | 批量拷贝模式：`random` 从独立的 `(batch_rows,1,576)` 批量源张量随机取 B 条 `(1,576)` 行 scatter/gather；`broadcast` 广播整张最大 scale 的 src 到 B 个连续切片 |
-| `--batch-rows` | 16384 | `random` 模式批量源张量的第一维（shape=(batch_rows,1,576)） |
+| `--batch-mode` | `random` | 批量拷贝模式：`random` 从独立的 `(batch_rows,1,576)` 批量源张量随机取 B 条 `(1,576)` 行 scatter/gather；`strided` 从同一批量源按固定间隔取 B 行（源行间隔由 `--step-size` 控制，dst 保持连续）；`broadcast` 广播整张最大 scale 的 src 到 B 个连续切片 |
+| `--batch-rows` | 16384 | `random`/`strided` 模式批量源张量的第一维（shape=(batch_rows,1,576)） |
+| `--step-size` | 0 | `--batch-mode strided`：相邻源行的间隔（以 (1,576) 行为单位），0=连续取 0,1,2,...，1=隔一行取 0,2,4,...；dst 保持连续 |
 | `--seed` | 42 | `--batch-mode random` 随机行选择的种子 |
 | `--dtype` | `int32` | 张量 dtype（int8/int16/int32/int64/float16/float32/float64） |
 | `--local-dram` / `--max-dram` | 1GiB / 1GiB | 每机贡献/上限 DRAM，2MiB 对齐 |
 | `--extend-lib-path` | 环境变量 | 手动指定 `libmf_hybm_copy_extend.so` 目录 |
-| `--poll-timeout` | 120s | rank1 等待完成标记的超时 |
-| `--ready-timeout` | 120s | rank0 开测前等待 peer GVA 可达（rank1 join+import）的超时 |
+| `--ready-timeout` | 120s | rank1 就绪握手超时：循环向 rank0 的 DRAM 池末尾写 READY_MAGIC，直到 rank0 切片 import 到本机设备页表 |
 
-例如只测 4.5MiB 与 144KiB 两档的单条时延：
+例如只测 4.5MiB 与 144KiB 两档的单条时延（在 rank1 上跑，rank0 仍持有内存）：
 
 ```bash
-python3 microbench_sdma_mte.py --rank 0 --scales 64,2048 --url tcp://<rank0-ip>:8570 --nic <rank0-数据面ip>
+python3 microbench_sdma_mte.py --rank 1 --scales 64,2048 --url tcp://<rank0-ip>:8570 --nic <rank1-数据面ip>
 ```
 
 ## 结果解读
@@ -163,18 +174,16 @@ python3 microbench_sdma_mte.py --rank 0 --scales 64,2048 --url tcp://<rank0-ip>:
   当前拓扑（非 A3 超节点 / A2 跨机）不支持 SDMA/MTE 直访远端 DRAM，数据面会回退 RDMA；
 - 数据校验不过：确认 tensor `nbytes` 和 `data_ptr` 都是 64B 整数倍/对齐（脚本已断言），
   且双机 `--local-dram`/`--max-dram` 一致、都 join 成功；
-- 批量区域超出 `--local-dram`：脚本会报错，调小 `--batch-size` 或调大池大小。批量区域公式：
-  `random` 模式为 `最大 scale 的 nbytes + batch_size × 单行字节`（批量区放在 `peer_gva + nbytes` 之后，
-  不碰 offset 0 的 rank1 校验区；随机行从独立的 `(batch_rows,1,576)` 批量源张量里挑，无需整张落盘），
-  `broadcast` 模式为 `batch_size × 最大 scale 的 nbytes`；均需给末尾 64B 完成标记留位（见运行期断言）；
-- rank1 报 `Segmentation fault`：旧版 rank1 用 `gva_to_va` + `memmove` 直读本机 DRAM 池，在
-  910C/GVA_V4（A3 超节点）下 DRAM 池是 `HybmVmmBasedSegment`，`gva_to_va` 返回的是设备侧 LVA，
-  CPU 进程直读即段错误。当前版本已改为 rank1 通过 G2L 拷贝引擎轮询/校验，无需 CPU 直读 GVA；
-- rank1 等不到完成标记（超时）：确认双机 `--local-dram`/`--max-dram` 一致，且 rank1 的 G2L
-  拷贝通路可用（能读到自己的 DRAM 池）；
-- rank0 打印完 `scale (64, 1, 576)` 报错 / “有时跑会出错”：BM 组引擎是**动态成员模式**，
-  rank0 的 `join()` 只等自己就返回，rank1 的 DRAM 切片 import 是异步的；若 rank1 起得晚，
-  rank0 第一笔拷贝会撞上尚未映射的 GVA。当前版本 rank0 开测前先 `wait_peer_ready` 握手
-  （小 L2G+G2L 回读直到 peer GVA 可达）——rank1 起晚一点会自动等它，rank1 完全没起则
-  在 `--ready-timeout`（默认 120s）后明确报 `waiting for peer GVA ... to become reachable`，
-  不会在第一笔拷贝上莫名失败。正常的双机启动顺序仍是先 rank0、再 rank1。
+- 批量区域超出 `--local-dram`：脚本会报错，调小 `--batch-size` / `--step-size` 或调大池大小。批量区域公式：
+  `random`/`strided` 模式为 `最大 scale 的 nbytes + batch_size × 单行字节`（批量区放在 `peer_gva + nbytes`
+  之后，不碰 offset 0 的单条拷贝回读区；行从独立的 `(batch_rows,1,576)` 批量源张量里挑，无需整张落盘），
+  `broadcast` 模式为 `batch_size × 最大 scale 的 nbytes`；均需给末尾 64B 握手块留位（见运行期断言）；
+- rank1 报 `timeout ... sending ready handshake to rank0's DRAM pool`：rank0 未启动 / join 未完成，
+  rank0 的切片没 import 进 rank1 的设备页表。确认 rank0 已起来并打印出 `holding DRAM pool`；
+- rank1 一直不打印 benchmark 输出 / "有时跑会出错"：BM 组引擎是**动态成员模式**，`join()` 只等自己
+  就返回，对端切片 import 进本机设备页表是异步的。当前版本 rank1 开测前先 `send_peer_ready` 握手：
+  循环向 rank0 的 DRAM 池末尾写 READY_MAGIC，**写成功即说明本机对 rank0 的 import 已完成**（能写就
+  说明映射好了；且 JoinHandle 内的 GroupGatherResult barrier 两边一起过，rank0 侧 import 也同步完成），
+  之后才开测——rank0 起得慢会自动等它，rank0 完全没起则 `--ready-timeout`（默认 120s）超时明确报错。
+  rank0 侧设计上不碰 peer GVA，不会因对端未就绪而失败。正常启动顺序仍是先 rank0、再 rank1；
+- 想换参数重跑：rank1 退出后，保持 rank0 的持有进程不动，重新起一个 rank1 即可（rank0 持有期间可反复跑）。

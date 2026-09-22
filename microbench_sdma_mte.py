@@ -28,21 +28,25 @@
   2. 批量吞吐（只在最大 scale）：copy_data_batch 聚合带宽
      （默认 --batch-mode random：从独立的批量源张量 (batch_rows=16384, 1, 576) 随机取 B 条
       (1,576) 行，scatter 到 peer 批量区 / 从 peer 批量区 gather 回 scratch；
+      --batch-mode strided：从同一批量源按固定间隔取 B 行（--step-size 控制源行间隔，
+      0=连续取 0,1,2,...，1=隔一行取 0,2,4,...），dst 保持连续；
       --batch-mode broadcast 则把整张最大 scale 的 src 广播到 peer DRAM 的 B 个连续切片 /
       从 B 个连续切片收进 dst）
 
-角色：rank0 为驱动方，对 rank1 的 DRAM 池 GVA 执行全部计时；rank1 join 后通过 G2L 拷贝引擎
-     轮询完成标记并校验落盘数据（不 CPU 直读 GVA——910C/GVA_V4 下 DRAM 池 LVA 是设备侧地址，
-     memmove 会段错误），确认后退出。
+角色（双机 --world_size 2）：
+     rank0 = config store host + 纯内存持有方：建池 join 后循环 sleep，直到 Ctrl+C 退出。
+             不碰 peer GVA、不执行任何拷贝，因此不会因 peer 切片未 import 而报错。
+     rank1 = benchmark 驱动/计时方：join 后先 send_peer_ready——循环向 rank0 的 DRAM 池末尾
+             写 READY_MAGIC，写成功即说明 rank0 切片已 import 进本机设备页表（能写就说明映射
+             好了；JoinHandle 的 GroupGatherResult barrier 两边一起过，rank0 侧 import 也同步
+             完成），之后对 peer_gva 的全部计时拷贝必然可达。
+     动态组模式下任意一方的 join() 只等自己就返回，"把对端切片 import 进本机设备页表"是异步
+     的——这正是"有时跑会出错"的根因；握手把它变成明确的等待或超时。
 
-    动态组模式下 rank0 的 join() 只等自己就返回，rank1 的 DRAM 切片 import 是异步的；
-    rank0 开测前先 wait_peer_ready 握手（小 L2G+G2L 回读直到 peer GVA 可达），
-    避免 rank1 起得晚时第一笔拷贝撞上未映射的 GVA、或 rank1 未启动时糊里糊涂地挂。
-
-运行（两台机器各一个终端）：
-  # rank0（默认启动 config store）：
+运行（两台机器各一个终端，先 rank0 后 rank1）：
+  # rank0（config store host + 内存持有方，Ctrl+C 退出）：
   python3 microbench_sdma_mte.py --rank 0 --url tcp://<rank0-ip>:8570 --nic <rank0-数据面ip>
-  # rank1：
+  # rank1（benchmark 驱动/计时）：
   python3 microbench_sdma_mte.py --rank 1 --url tcp://<rank0-ip>:8570 --nic <rank1-数据面ip>
 
 单机自测（无第二台机，--world_size 1）：
@@ -64,8 +68,8 @@ from bm_mem_pool import BmDramPool
 SHAPE = (2048, 1, 576)
 COPY_EXTEND_FLAG = 1 << 1          # 见 src/smem/include/host/smem.h：走 hybm_copy_extend（MTE）
 BLOCK_ALIGN = 64                   # hybm_copy_kernel.cpp 的 SINGLE_COPY_SLICE，长度须 64B 整数倍
-DONE_MAGIC = 0x5E7ABE5E            # 完成标记，int32 可表示（< 2^31）
-DONE_BLOCK_BYTES = 64              # 完成标记块大小，保证 64B 对齐
+DONE_BLOCK_BYTES = 64              # 握手/标记块大小，保证 64B 对齐
+READY_MAGIC = 0x51DE9A7E           # 握手标记：rank1 join 后写入 rank0 DRAM 池末尾，< 2^31
 
 DTYPES = {
     "int8": torch.int8,
@@ -82,7 +86,7 @@ DIRECTIONS = ("L2G", "G2L")
 
 
 def check_extend_lib():
-    """确认 MTE 路径的编译产物 libmf_hybm_copy_extend.so 可用（rank0 才需要）。"""
+    """确认 MTE 路径的编译产物 libmf_hybm_copy_extend.so 可用（benchmark 驱动方 rank1 才需要）。"""
     lib_dir = os.environ.get("MEMFABRIC_HYBRID_EXTEND_LIB_PATH")
     if not lib_dir:
         raise RuntimeError(
@@ -107,7 +111,8 @@ def check_extend_lib():
 def parse_args():
     ap = argparse.ArgumentParser(
         description="dual-node DRAM BM pool: SDMA vs MTE (COPY_EXTEND_FLAG) transfer microbench")
-    ap.add_argument("--rank", type=int, default=0, help="global rank id: 0(driver) or 1(verifier)")
+    ap.add_argument("--rank", type=int, default=0,
+                    help="global rank id: 0(store host + memory holder) or 1(benchmark driver)")
     ap.add_argument("--world_size", type=int, default=2, choices=[1, 2],
                     help="1: single-machine smoke; 2: dual-machine (default)")
     ap.add_argument("--device", type=int, default=0, help="local NPU device id, default 0")
@@ -126,22 +131,25 @@ def parse_args():
                     help="tensors per copy_data_batch call (batch region must fit local DRAM)")
     ap.add_argument("--batch-iters", type=int, default=20, help="batch-copy iterations per measurement")
     ap.add_argument("--batch-warmup", type=int, default=2, help="batch-copy warmup iterations")
-    ap.add_argument("--batch-mode", default="random", choices=["random", "broadcast"],
+    ap.add_argument("--batch-mode", default="random", choices=["random", "strided", "broadcast"],
                     help="batch copy pattern: 'random' (default) scatters B random (1,576) rows of the "
-                         "dedicated batch-source tensor into the peer batch region; 'broadcast' copies the "
-                         "largest-scale tensor to B consecutive slices")
+                         "dedicated batch-source tensor into the peer batch region; 'strided' copies B rows "
+                         "with a fixed source interval (--step-size) into a contiguous peer region; "
+                         "'broadcast' copies the largest-scale tensor to B consecutive slices")
     ap.add_argument("--batch-rows", type=int, default=16384,
-                    help="first dim of the dedicated batch-source tensor (batch_rows, 1, 576); random mode "
-                         "samples batch_size (1,576) rows from it")
+                    help="first dim of the dedicated batch-source tensor (batch_rows, 1, 576); 'random' and "
+                         "'strided' modes take rows from it")
+    ap.add_argument("--step-size", type=int, default=0,
+                    help="--batch-mode strided: interval (in (1,576) rows) between consecutive source rows, "
+                         "0 = contiguous (rows 0,1,2,...), 1 = skip one (rows 0,2,4,...); destination stays "
+                         "contiguous")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed for --batch-mode random row selection")
     ap.add_argument("--scales", default="64,128,256,512,1024,2048",
                     help="comma-separated first-dim values for the single-copy scale sweep "
                          "(shape=(N,1,576)); batch throughput is measured on the largest scale only")
-    ap.add_argument("--poll-timeout", type=int, default=120,
-                    help="rank1 timeout (s) waiting for the done marker from rank0")
     ap.add_argument("--ready-timeout", type=int, default=120,
-                    help="rank0 timeout (s) waiting for the peer DRAM GVA to become reachable "
-                         "(rank1 joined + imported on this device) before benchmarking")
+                    help="rank1 timeout (s) for the ready handshake: retries writing READY_MAGIC into "
+                         "rank0's DRAM pool until rank0's slice is imported on this device")
     ap.add_argument("--extend-lib-path", default=None,
                     help="dir containing libmf_hybm_copy_extend.so, sets MEMFABRIC_HYBRID_EXTEND_LIB_PATH")
     return ap.parse_args()
@@ -174,7 +182,7 @@ def shape_for(scale):
 
 
 def parse_scales(s):
-    """解析 --scales "64,128,..."，去重升序，保证最后一档是最大规模（批量吞吐/完成标记用它）。"""
+    """解析 --scales "64,128,..."，去重升序，保证最后一档是最大规模（批量吞吐用它）。"""
     scales = [int(x) for x in s.split(",") if x.strip()]
     assert scales, "no scales given"
     assert all(x > 0 for x in scales), "scales must be positive"
@@ -209,7 +217,7 @@ def bench_one(pool, direction, engine, flags, src, dst, peer_gva, nbytes, args, 
               batch_src=None):
     """对单个 方向 x 引擎 组合做正确性校验 + 单条时延/带宽；with_batch 时再加批量吞吐。
 
-    batch_src：random 批量模式专用的批量源张量 (batch_rows, 1, 576)，独立于 scale 扫描的 src。
+    batch_src：random/strided 批量模式专用的批量源张量 (batch_rows, 1, 576)，独立于 scale 扫描的 src。
     """
     shape = tuple(src.shape)
     row = {"shape": shape, "direction": direction, "engine": engine,
@@ -245,33 +253,39 @@ def bench_one(pool, direction, engine, flags, src, dst, peer_gva, nbytes, args, 
     # 3) 批量吞吐：copy_data_batch 一次搬 B 条 (1,576) 行
     #    - random（默认）：从独立批量源 batch_src(batch_rows,1,576) 随机取 B 行，scatter 到 peer 批量区 /
     #      从 peer 批量区 gather 回本地 scratch
+    #    - strided：从 batch_src 按固定间隔取 B 行（--step-size 控制源行间隔，0=连续取 0,1,2,...；
+    #      1=隔一行取 0,2,4,...），dst 仍连续，scatter/gather 同上
     #    - broadcast：把整张 src 广播到 peer DRAM 的 B 个连续切片 / 从 B 个连续切片收进 dst
     try:
         count = args.batch_size
         row_b = nbytes // shape[0]            # 单条 (1,576) 行的字节数 = element_size * 576（src 与 batch_src 同 dtype，行字节相同）
-        if args.batch_mode == "random":
-            assert batch_src is not None, "random batch mode requires batch_src"
-            n_rows = batch_src.shape[0]                   # 从 (batch_rows, 1, 576) 的批量源里随机挑
-            rng = random.Random(args.seed)
-            idx = rng.sample(range(n_rows), count)
+        if args.batch_mode in ("random", "strided"):
+            assert batch_src is not None, "random/strided batch mode requires batch_src"
+            n_rows = batch_src.shape[0]                   # 从 (batch_rows, 1, 576) 的批量源里取行
+            if args.batch_mode == "random":
+                rng = random.Random(args.seed)
+                idx = rng.sample(range(n_rows), count)
+            else:  # strided：源行下标按固定间隔取（间隔 = step_size+1 行），dst 保持连续
+                step = args.step_size + 1
+                idx = [i * step for i in range(count)]
             idx_t = torch.tensor(idx, dtype=torch.int64, device="npu")
-            batch_base = peer_gva + nbytes                 # 避开 offset 0（rank1 校验区）与末尾 done marker
+            batch_base = peer_gva + nbytes                 # 避开 offset 0（单条拷贝回读区）与末尾 64B 握手块
             src_rows = [batch_src.data_ptr() + i * row_b for i in idx]
             dst_rows = [batch_base + j * row_b for j in range(count)]
             sizes = [row_b] * count
-            # 1) 正确性：随机行 scatter -> peer 批量区 -> gather 回 scratch -> 与 batch_src.index_select 逐元素相等
-            #    （顺带把 peer 批量区填上随机行的数据，保证 G2L 计时读到有效数据）
+            # 1) 正确性：所选行 scatter -> peer 批量区 -> gather 回 scratch -> 与 batch_src.index_select 逐元素相等
+            #    （顺带把 peer 批量区填上所选行的数据，保证 G2L 计时读到有效数据）
             scratch = torch.empty(count, *shape[1:], dtype=batch_src.dtype, device="npu")
             assert scratch.data_ptr() % BLOCK_ALIGN == 0, f"scratch not {BLOCK_ALIGN}B aligned"
-            assert pool.copy_batch(src_rows, dst_rows, sizes, count, bm.BmCopyType.L2G, flags) == 0, "random L2G fill"
+            assert pool.copy_batch(src_rows, dst_rows, sizes, count, bm.BmCopyType.L2G, flags) == 0, "batch L2G fill"
             torch_npu.npu.synchronize()
             got_rows = [scratch.data_ptr() + j * row_b for j in range(count)]
-            assert pool.copy_batch(dst_rows, got_rows, sizes, count, bm.BmCopyType.G2L, flags) == 0, "random G2L gather"
+            assert pool.copy_batch(dst_rows, got_rows, sizes, count, bm.BmCopyType.G2L, flags) == 0, "batch G2L gather"
             torch_npu.npu.synchronize()
             if not torch.equal(scratch, batch_src.index_select(0, idx_t)):
-                raise RuntimeError("random-row batch round-trip mismatch")
-            # 2) 计时：L2G 从 batch_src 随机行 scatter 到 peer；G2L 从 peer 批量区 gather 回 scratch
-            #    （回写目标固定用 scratch，不污染 src/dst/batch_src，避免破坏后续组合的 step1 回读校验与 rank1 校验）
+                raise RuntimeError("batch round-trip mismatch")
+            # 2) 计时：L2G 从 batch_src 所选行 scatter 到 peer；G2L 从 peer 批量区 gather 回 scratch
+            #    （回写目标固定用 scratch，不污染 src/dst/batch_src，避免破坏后续组合的 step1 回读校验）
             if direction == "L2G":
                 avg_b = time_batch_copy(pool, copy_type, flags, src_rows, dst_rows, sizes,
                                         count, args.batch_warmup, args.batch_iters)
@@ -343,103 +357,121 @@ def print_scale_table(rows, dtype_name):
         print(f"{shp:<16} {r['direction']:<9} {r['engine']:<6} {lat:>12} {bw:>16}{note}")
 
 
-def write_done_marker(pool, peer_gva, local_dram_size):
-    """把完成标记写到对端 DRAM 池末尾（64B 对齐块），rank1 轮询该块开头 4 字节。"""
-    offset = local_dram_size - DONE_BLOCK_BYTES
+def send_peer_ready(pool, peer_gva, local_dram_size, timeout):
+    """rank1 join 后向 rank0 的 DRAM 池末尾写 READY_MAGIC，完成"peer 已就绪"握手。
+
+    写成功的前提是 rank0 的切片已 import 进**本机**设备页表（rank1 自己的 JoinHandle 里
+    hybm_import + hybm_mmap 完成）；在此之前写会返回非 0，循环重试即可。
+    关键：写成功同时意味着**两边**的 JoinHandle 都已完成——JoinHandle 里的
+    GroupGatherResult barrier（smem_bm_entry.cpp GroupOpBarrier）是 rank0/rank1 一起过的，
+    rank1 的 import 若做完，rank0 把 rank1 切片 import 进本机设备页表也必然同步做完。
+    所以 rank1 收到成功返回后再对 peer_gva 做拷贝必然可达，不会撞未映射 GVA。
+    失败只是 host 侧段校验返回非 0，不毒化设备流；最坏情况是明确的超时报错。
+    """
+    slot = peer_gva + local_dram_size - DONE_BLOCK_BYTES
     marker = torch.zeros(DONE_BLOCK_BYTES // 4, dtype=torch.int32, device="npu")
-    marker[0] = DONE_MAGIC
+    marker[0] = READY_MAGIC
     torch_npu.npu.synchronize()
-    ret = pool.copy(marker.data_ptr(), peer_gva + offset, DONE_BLOCK_BYTES, bm.BmCopyType.L2G, 0)
-    if ret != 0:  # SDMA 直访失败时回退 MTE，避免 rank1 干等超时
-        print(f"[rank {pool.rank_id}] WARN: SDMA marker write failed ({ret}), trying MTE")
-        ret = pool.copy(marker.data_ptr(), peer_gva + offset, DONE_BLOCK_BYTES,
-                        bm.BmCopyType.L2G, COPY_EXTEND_FLAG)
-    assert ret == 0, f"write done marker failed: {ret}"
-    print(f"[rank {pool.rank_id}] done marker written at GVA 0x{peer_gva + offset:x}")
-
-
-def wait_done_marker(pool, my_gva, local_dram_size, timeout):
-    """rank1 用 G2L 拷贝引擎轮询自己 DRAM 池末尾的完成标记。
-
-    不通过 gva_to_va + CPU memmove 直读本机 DRAM 池：A3/Ascend 910C + GVA_V4 下
-    DRAM 池是 HybmVmmBasedSegment，其 LVA 由 HalMemAddressReserve 保留在设备侧地址空间，
-    CPU 进程不可直读（memmove 会段错误）。改为 G2L 把标记块拷进 NPU buffer 再比对，
-    全程走设备通路，与段类型无关，两种 segment 都能工作。
-    """
-    offset = local_dram_size - DONE_BLOCK_BYTES
-    marker_gva = my_gva + offset
-    buf = torch.zeros(DONE_BLOCK_BYTES // 4, dtype=torch.int32, device="npu")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        ret = pool.copy(marker_gva, buf.data_ptr(), DONE_BLOCK_BYTES, bm.BmCopyType.G2L, 0)
-        assert ret == 0, f"marker poll copy(G2L) failed: {ret}"
-        torch_npu.npu.synchronize()
-        if buf[0].item() == DONE_MAGIC:
-            print(f"[rank {pool.rank_id}] done marker received, benchmark on peer finished")
-            return
-        time.sleep(0.2)
-    raise RuntimeError(f"timeout {timeout}s waiting for done marker (offset 0x{offset:x})")
-
-
-def verify_peer_data(pool, my_gva, dtype, nbytes, shape=SHAPE):
-    """rank1 校验 rank0 收尾时留在自己 DRAM 池开头的 src 模式（最大 scale）。
-
-    G2L 把本机 DRAM 池 GVA 拷回 NPU 再逐元素比对（同 wait_done_marker 的原因，
-    不 CPU 直读 GVA——VMM segment 下返回的是设备侧 LVA，memmove 会段错误）。
-    """
-    got = torch.empty(shape, dtype=dtype, device="npu")
-    ret = pool.copy(my_gva, got.data_ptr(), nbytes, bm.BmCopyType.G2L, 0)
-    if ret != 0:
-        return False
-    torch_npu.npu.synchronize()
-    return torch.equal(got, make_pattern(dtype, shape))
-
-
-def wait_peer_ready(pool, peer_gva, timeout):
-    """rank0 join 后等待 peer 的 DRAM GVA 在本机设备上可达（rank1 join+import 完成）。
-
-    BM 组引擎是**动态成员模式**（smem_net_group_engine.cpp：groupSize 按实际 join 数增长，
-    见 UpdateBitmapFromRank / GroupJoin），rank0 的 join() 只等自己就返回，rank1 的 DRAM 切片
-    是异步 hybm_import 进本机设备页表的。若 rank1 起得晚，rank0 一 join 就开测，第一笔
-    copy 会撞上尚未映射的 GVA（拷贝失败/“有时跑会出错”）。这里循环做一次小的
-    L2G 写 + G2L 读回（先后试 SDMA/MTE 两条路径），任一路径成功即说明 GVA 已映射，
-    再开始计时；超时则明确报 peer 未就绪，而不是第一笔拷贝才炸。
-    """
-    probe = (torch.arange(256, dtype=torch.int64, device="npu") % 97).to(torch.int32)
-    readback = torch.empty(256, dtype=torch.int32, device="npu")
-    size = probe.nbytes  # 256 * 4B = 1024 B，64B 整数倍；data_ptr 512B 对齐
-    assert probe.data_ptr() % BLOCK_ALIGN == 0 and readback.data_ptr() % BLOCK_ALIGN == 0
     deadline = time.time() + timeout
     attempt = 0
     while time.time() < deadline:
         attempt += 1
-        for flags in (0, COPY_EXTEND_FLAG):
-            try:
-                if pool.copy(probe.data_ptr(), peer_gva, size, bm.BmCopyType.L2G, flags) != 0:
-                    continue
-                torch_npu.npu.synchronize()
-                if pool.copy(peer_gva, readback.data_ptr(), size, bm.BmCopyType.G2L, flags) != 0:
-                    continue
-                torch_npu.npu.synchronize()
-                if torch.equal(readback, probe):
-                    print(f"[rank {pool.rank_id}] peer GVA 0x{peer_gva:x} reachable "
-                          f"(attempt {attempt}, flags={flags})")
-                    return
-            except Exception:
-                continue
+        ret = pool.copy(marker.data_ptr(), slot, DONE_BLOCK_BYTES, bm.BmCopyType.L2G, 0)
+        if ret != 0:  # SDMA 直访失败时回退 MTE
+            ret = pool.copy(marker.data_ptr(), slot, DONE_BLOCK_BYTES,
+                            bm.BmCopyType.L2G, COPY_EXTEND_FLAG)
+        if ret == 0:
+            torch_npu.npu.synchronize()
+            print(f"[rank {pool.rank_id}] peer handshake sent (attempt {attempt})")
+            return
         time.sleep(0.2)
     raise RuntimeError(
-        f"[rank {pool.rank_id}] timeout {timeout}s waiting for peer GVA 0x{peer_gva:x} "
-        f"to become reachable; check rank1 is running and has joined "
-        f"(its DRAM slice must be imported on this device)")
+        f"[rank {pool.rank_id}] timeout {timeout}s sending ready handshake to rank0's DRAM "
+        f"pool at 0x{slot:x}; check rank0 is running and has joined")
 
 
-def run_rank0(args):
+def run_benchmark(pool, args, peer_gva):
+    """benchmark 主体：全部单条/批量计时的采集与表格输出。
+
+    双机由 rank1 调用，单机自测（--world_size 1）由 rank0 调用；peer_gva 为对端
+    （单机时自己）的 DRAM 池切片基址，本机对它的 L2G/G2L 拷贝就是被计时对象。
+    调用前必须保证对端切片已 import 进本机设备页表（调用方负责握手；单机自测天然满足）。
+    """
     if args.extend_lib_path:
         os.environ["MEMFABRIC_HYBRID_EXTEND_LIB_PATH"] = args.extend_lib_path
     extend_so = check_extend_lib()
-    print(f"[rank {args.rank}] MTE path lib: {extend_so}")
+    print(f"[rank {pool.rank_id}] MTE path lib: {extend_so}")
 
+    dtype = DTYPES[args.dtype]
+    scales = parse_scales(args.scales)
+    largest = scales[-1]
+    largest_nbytes = tensor_nbytes(dtype, shape_for(largest))
+
+    # 批量吞吐只在最大 scale 上测；批量区域须给末尾 64B 握手块留位
+    batch_row_nbytes = tensor_nbytes(dtype, (1, 576))      # 单条 (1,576) 行的字节数
+    if args.batch_mode in ("random", "strided"):
+        # random/strided：批量源是独立的 (batch_rows,1,576)，dst 连续放在 peer_gva + largest_nbytes 之后
+        batch_region = largest_nbytes + args.batch_size * batch_row_nbytes
+        if args.batch_mode == "random":
+            assert args.batch_size <= args.batch_rows, "random: batch-size must be <= --batch-rows"
+        else:
+            last_row = (args.batch_size - 1) * (args.step_size + 1)  # 源行下标从 0 起按步进
+            assert last_row < args.batch_rows, \
+                f"strided: last source row {last_row} >= batch_rows {args.batch_rows}; " \
+                f"reduce --batch-size or --step-size"
+    else:
+        batch_region = args.batch_size * largest_nbytes
+    assert batch_region <= args.local_dram - DONE_BLOCK_BYTES, \
+        f"batch region {batch_region}B exceeds local DRAM {args.local_dram}B minus handshake block; " \
+        f"reduce --batch-size"
+    print(f"[rank {pool.rank_id}] scales={scales}, iters={args.iters}, batch_size={args.batch_size} "
+          f"x batch_iters={args.batch_iters} (batch_mode={args.batch_mode}, batch_rows={args.batch_rows}, "
+          f"seed={args.seed})")
+
+    # random/strided 批量模式专用的批量源张量 (batch_rows, 1, 576)，独立于 scale 扫描的单条拷贝张量
+    batch_src = None
+    if args.batch_mode in ("random", "strided"):
+        batch_shape = (args.batch_rows, 1, 576)
+        batch_src = make_pattern(dtype, batch_shape)
+        assert batch_src.data_ptr() % BLOCK_ALIGN == 0, "batch_src not 64B aligned"
+        torch_npu.npu.synchronize()
+        print(f"[rank {pool.rank_id}] batch source tensor {batch_shape} "
+              f"nbytes={tensor_nbytes(dtype, batch_shape) / 1024 / 1024:.2f} MiB, "
+              f"ptr=0x{batch_src.data_ptr():x}")
+
+    rows = []
+    for scale in scales:
+        shape = shape_for(scale)
+        nbytes = tensor_nbytes(dtype, shape)
+        assert nbytes % BLOCK_ALIGN == 0, f"shape {shape} nbytes {nbytes} not {BLOCK_ALIGN}B aligned"
+        src = make_pattern(dtype, shape)
+        dst = torch.empty(shape, dtype=dtype, device="npu")
+        assert src.data_ptr() % BLOCK_ALIGN == 0, f"src not {BLOCK_ALIGN}B aligned"
+        assert dst.data_ptr() % BLOCK_ALIGN == 0, f"dst not {BLOCK_ALIGN}B aligned"
+        torch_npu.npu.synchronize()
+        print(f"[rank {pool.rank_id}] scale {shape} nbytes={nbytes} "
+              f"({nbytes / 1024 / 1024:.2f} MiB), src ptr=0x{src.data_ptr():x}")
+        with_batch = (scale == largest)  # 只有最大 scale 附带批量吞吐
+        for direction in DIRECTIONS:
+            for engine, flags in ENGINES:
+                row = bench_one(pool, direction, engine, flags, src, dst, peer_gva, nbytes, args,
+                                with_batch, batch_src)
+                rows.append(row)
+                if row["error"]:
+                    print(f"[rank {pool.rank_id}] {shape} {direction}/{engine}: {row['error']}")
+
+    print_scale_table(rows, args.dtype)
+    print_table([r for r in rows if r["shape"] == shape_for(largest)], shape_for(largest),
+                largest_nbytes, args.dtype)
+
+
+def run_rank0(args):
+    """rank0 = config store host + 纯内存持有方（双机）；单机自测时跑 benchmark。
+
+    双机：建池 join 后循环 sleep，直到 Ctrl+C 退出。不碰 peer GVA、不执行任何拷贝，
+    所以不会出现 peer 切片未 import 时直接访问对端地址的竞态/报错。
+    单机（--world_size 1）：对端即自己，建池后直接跑 benchmark（无需握手）。
+    """
     torch_npu.npu.set_device(args.device)
     pool = BmDramPool(rank=args.rank, world_size=args.world_size, device=args.device,
                       store_url=args.url, nic=args.nic,
@@ -450,82 +482,30 @@ def run_rank0(args):
         pool.create_pool(data_op_type=bm.BmDataOpType.SDMA)
         print(f"[rank {pool.rank_id}] DRAM pool joined (local={args.local_dram / (1 << 30):.2f}GiB, "
               f"max={args.max_dram / (1 << 30):.2f}GiB/rank)")
-
-        peer_rank = (pool.rank_id + 1) % args.world_size
-        peer_gva = pool.peer_gva(peer_rank, bm.BmMemType.HOST)
-        print(f"[rank {pool.rank_id}] peer_rank={peer_rank}, remote DRAM GVA=0x{peer_gva:x}")
-
-        # 动态组模式下 join() 只等自己就返回，rank1 的 DRAM 切片 import 是异步的；
-        # 先握手等 peer GVA 可达再开测，避免第一笔拷贝撞上尚未映射的 GVA
-        # （rank1 起得晚时“有时跑会出错”、rank1 未启动时在这里就明确超时报错）
-        if args.world_size > 1:
-            wait_peer_ready(pool, peer_gva, args.ready_timeout)
-
-        dtype = DTYPES[args.dtype]
-        scales = parse_scales(args.scales)
-        largest = scales[-1]
-        largest_nbytes = tensor_nbytes(dtype, shape_for(largest))
-
-        # 批量吞吐只在最大 scale 上测；批量区域须给末尾 64B 完成标记留位
-        batch_row_nbytes = tensor_nbytes(dtype, (1, 576))      # 单条 (1,576) 行的字节数
-        if args.batch_mode == "random":
-            # 随机行模式：从独立的 (batch_rows, 1, 576) 批量源张量里挑 batch_size 行，
-            # 批量区放在 peer_gva + largest_nbytes 之后（不碰 offset 0 的 rank1 校验区）
-            batch_region = largest_nbytes + args.batch_size * batch_row_nbytes
-            assert args.batch_size <= args.batch_rows, "batch-size must be <= --batch-rows for random-row mode"
-        else:
-            batch_region = args.batch_size * largest_nbytes
-        assert batch_region <= args.local_dram - DONE_BLOCK_BYTES, \
-            f"batch region {batch_region}B exceeds local DRAM {args.local_dram}B minus done-marker block; " \
-            f"reduce --batch-size"
-        print(f"[rank {pool.rank_id}] scales={scales}, iters={args.iters}, batch_size={args.batch_size} "
-              f"x batch_iters={args.batch_iters} (batch_mode={args.batch_mode}, batch_rows={args.batch_rows}, "
-              f"seed={args.seed})")
-
-        # 随机行批量模式专用的批量源张量 (batch_rows, 1, 576)，独立于 scale 扫描的单条拷贝张量
-        batch_src = None
-        if args.batch_mode == "random":
-            batch_shape = (args.batch_rows, 1, 576)
-            batch_src = make_pattern(dtype, batch_shape)
-            assert batch_src.data_ptr() % BLOCK_ALIGN == 0, "batch_src not 64B aligned"
-            torch_npu.npu.synchronize()
-            print(f"[rank {pool.rank_id}] batch source tensor {batch_shape} "
-                  f"nbytes={tensor_nbytes(dtype, batch_shape) / 1024 / 1024:.2f} MiB, "
-                  f"ptr=0x{batch_src.data_ptr():x}")
-
-        rows = []
-        for scale in scales:
-            shape = shape_for(scale)
-            nbytes = tensor_nbytes(dtype, shape)
-            assert nbytes % BLOCK_ALIGN == 0, f"shape {shape} nbytes {nbytes} not {BLOCK_ALIGN}B aligned"
-            src = make_pattern(dtype, shape)
-            dst = torch.empty(shape, dtype=dtype, device="npu")
-            assert src.data_ptr() % BLOCK_ALIGN == 0, f"src not {BLOCK_ALIGN}B aligned"
-            assert dst.data_ptr() % BLOCK_ALIGN == 0, f"dst not {BLOCK_ALIGN}B aligned"
-            torch_npu.npu.synchronize()
-            print(f"[rank {pool.rank_id}] scale {shape} nbytes={nbytes} "
-                  f"({nbytes / 1024 / 1024:.2f} MiB), src ptr=0x{src.data_ptr():x}")
-            with_batch = (scale == largest)  # 只有最大 scale 附带批量吞吐
-            for direction in DIRECTIONS:
-                for engine, flags in ENGINES:
-                    row = bench_one(pool, direction, engine, flags, src, dst, peer_gva, nbytes, args,
-                                    with_batch, batch_src)
-                    rows.append(row)
-                    if row["error"]:
-                        print(f"[rank {pool.rank_id}] {shape} {direction}/{engine}: {row['error']}")
-
-        if args.world_size > 1:
-            write_done_marker(pool, peer_gva, args.local_dram)
-
-        print_scale_table(rows, args.dtype)
-        print_table([r for r in rows if r["shape"] == shape_for(largest)], shape_for(largest),
-                    largest_nbytes, args.dtype)
+        if args.world_size == 1:
+            peer_gva = pool.peer_gva(0, bm.BmMemType.HOST)   # 单机：对端就是自己
+            print(f"[rank {pool.rank_id}] single-machine mode, peer == self (GVA=0x{peer_gva:x})")
+            run_benchmark(pool, args, peer_gva)
+            return
+        print(f"[rank {pool.rank_id}] holding DRAM pool, Ctrl+C to exit ...")
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            print(f"[rank {pool.rank_id}] Ctrl+C received, exiting")
     finally:
         pool.destroy()
     print(f"[rank {pool.rank_id}] done.")
 
 
 def run_rank1(args):
+    """rank1 = benchmark 驱动/计时方。
+
+    动态组模式下 join() 只等自己，"把 rank0 切片 import 进本机设备页表"是异步的。
+    send_peer_ready 循环向 rank0 的 DRAM 池末尾写 READY_MAGIC，写成功即说明 import
+    已完成（能写就说明映射好了；且 barrier 相互性保证 rank0 侧 import 也同步完成），
+    之后对 peer_gva 的拷贝必然可达，再开始计时。
+    """
     torch_npu.npu.set_device(args.device)
     pool = BmDramPool(rank=args.rank, world_size=args.world_size, device=args.device,
                       store_url=args.url, nic=args.nic,
@@ -534,21 +514,13 @@ def run_rank1(args):
     try:
         pool.initialize()
         pool.create_pool(data_op_type=bm.BmDataOpType.SDMA)
-        print(f"[rank {pool.rank_id}] joined, waiting for peer benchmark done marker ...")
+        print(f"[rank {pool.rank_id}] joined, waiting for rank0's DRAM slice to be importable ...")
 
-        my_gva = pool.peer_gva(pool.rank_id, bm.BmMemType.HOST)
-        wait_done_marker(pool, my_gva, args.local_dram, args.poll_timeout)
+        peer_gva = pool.peer_gva(0, bm.BmMemType.HOST)       # rank0 的切片基址
+        print(f"[rank {pool.rank_id}] peer_rank=0, remote DRAM GVA=0x{peer_gva:x}")
+        send_peer_ready(pool, peer_gva, args.local_dram, args.ready_timeout)
 
-        # 校验 rank0 收尾时留在本机 DRAM 池开头的最大 scale 的 src 模式
-        # （G2L 拷回 NPU 比对，双机 --dtype/--scales 需一致）
-        scales = parse_scales(args.scales)
-        shape = shape_for(scales[-1])
-        dtype = DTYPES[args.dtype]
-        nbytes = tensor_nbytes(dtype, shape)
-        if verify_peer_data(pool, my_gva, dtype, nbytes, shape):
-            print(f"[rank {pool.rank_id}] peer data verify OK: rank0's largest-scale tensor landed in my DRAM pool")
-        else:
-            print(f"[rank {pool.rank_id}] WARN: peer data verify MISMATCH")
+        run_benchmark(pool, args, peer_gva)
     finally:
         pool.destroy()
     print(f"[rank {pool.rank_id}] done.")
@@ -560,6 +532,7 @@ def main():
     assert args.local_dram % (2 << 20) == 0 and args.max_dram % (2 << 20) == 0, "DRAM size must be 2MiB aligned"
     assert args.iters > 0 and args.warmup >= 0 and args.batch_size > 0, "invalid iterations/batch-size"
     assert args.batch_rows > 0, "batch-rows must be positive"
+    assert args.step_size >= 0, "step-size must be non-negative"
     try:
         if args.rank == 0:
             run_rank0(args)
