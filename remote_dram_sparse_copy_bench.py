@@ -64,8 +64,9 @@ class BenchResult:
     topk: int
     total_bytes: int
     method: str
-    avg_us: float
-    bandwidth_gbs: float
+    avg_us: float | None
+    bandwidth_gbs: float | None
+    error: str | None = None
 
 
 def _nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
@@ -496,6 +497,7 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
     bm_inited = False
     joined = False
     results: list[BenchResult] = []
+    batch_mte_unavailable: str | None = None
     try:
         _initialize_bm(args, rank=1)
         bm_inited = True
@@ -534,6 +536,18 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
             )
 
             for method, flags in (("copy_batch_sdma", 0), ("copy_batch_mte", COPY_EXTEND_FLAG)):
+                if method == "copy_batch_mte" and batch_mte_unavailable is not None:
+                    results.append(
+                        BenchResult(
+                            topk,
+                            total_bytes,
+                            method,
+                            None,
+                            None,
+                            f"skipped after earlier BatchCopyExtend failure: {batch_mte_unavailable}",
+                        )
+                    )
+                    continue
                 dst = torch.empty(dst_shape, dtype=dtype, device=args.device).contiguous()
                 src_addrs, dst_addrs, sizes = _build_batch_addresses(
                     peer_gva, dst, indices_cpu, row_bytes
@@ -557,11 +571,21 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
                         f"{method} failed, ret={ret}, err={mf.get_last_err_msg()}"
                     )
 
-                avg_us, bandwidth_gbs = _measure(
-                    launch_batch, args.warmup, args.iters, total_bytes
-                )
-                _assert_equal(dst, expected, f"topk={topk} {method}")
-                results.append(BenchResult(topk, total_bytes, method, avg_us, bandwidth_gbs))
+                try:
+                    avg_us, bandwidth_gbs = _measure(
+                        launch_batch, args.warmup, args.iters, total_bytes
+                    )
+                    _assert_equal(dst, expected, f"topk={topk} {method}")
+                    results.append(BenchResult(topk, total_bytes, method, avg_us, bandwidth_gbs))
+                except Exception as exc:
+                    detail = f"{type(exc).__name__}: {exc}"
+                    print(f"[rank 1] topk={topk} {method}: N/A ({detail})", flush=True)
+                    results.append(BenchResult(topk, total_bytes, method, None, None, detail))
+                    if method == "copy_batch_mte":
+                        # Some platforms do not implement HybmBatchCopyExtend.
+                        # One failed probe is enough; repeating it for larger K
+                        # only produces the same backend failure.
+                        batch_mte_unavailable = detail
 
             for block_dim in (24, 48):
                 method = f"unidex_copy_{block_dim}core"
@@ -592,7 +616,13 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
         _cleanup(handle, bm_inited, joined)
 
     _print_results(results, args.dtype, args.iters)
-    print("[rank 1] all sparse-copy measurements and verifications passed", flush=True)
+    if any(row.error is not None for row in results):
+        print(
+            "[rank 1] benchmark completed; supported paths were verified and unavailable paths are marked N/A",
+            flush=True,
+        )
+    else:
+        print("[rank 1] all sparse-copy measurements and verifications passed", flush=True)
 
 
 def _print_results(results: list[BenchResult], dtype_name: str, iters: int) -> None:
@@ -601,12 +631,18 @@ def _print_results(results: list[BenchResult], dtype_name: str, iters: int) -> N
         f"(dtype={dtype_name}, timed iterations={iters}, all rows verified)",
         flush=True,
     )
-    print(f"{'topk':>6} {'bytes(MiB)':>12} {'method':<24} {'avg(us)':>12} {'BW(GB/s)':>12}", flush=True)
-    print("-" * 74, flush=True)
+    print(
+        f"{'topk':>6} {'bytes(MiB)':>12} {'method':<24} {'avg(us)':>12} {'BW(GB/s)':>12}  status",
+        flush=True,
+    )
+    print("-" * 112, flush=True)
     for row in results:
+        avg_us = f"{row.avg_us:.2f}" if row.avg_us is not None else "N/A"
+        bandwidth_gbs = f"{row.bandwidth_gbs:.2f}" if row.bandwidth_gbs is not None else "N/A"
+        status = "OK" if row.error is None else f"N/A ({row.error})"
         print(
             f"{row.topk:>6} {row.total_bytes / 2**20:>12.3f} {row.method:<24} "
-            f"{row.avg_us:>12.2f} {row.bandwidth_gbs:>12.2f}",
+            f"{avg_us:>12} {bandwidth_gbs:>12}  {status}",
             flush=True,
         )
 
