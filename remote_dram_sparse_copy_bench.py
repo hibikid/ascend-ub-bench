@@ -437,10 +437,17 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
         control_connection = _wait_for_rank1_peer_ready(control_listener, args.control_timeout)
 
         try:
+            stage_flags = 0 if args.source_stage_engine == "sdma" else COPY_EXTEND_FLAG
             ret = handle.copy_data(
-                src.data_ptr(), source_gva, source_bytes, bm.BmCopyType.L2GH, COPY_EXTEND_FLAG
+                # Match microbench_sdma_mte.py's Global-HOST path.  The GVA
+                # itself identifies the host segment, so L2G is translated to
+                # LOCAL_DEVICE_TO_GLOBAL_HOST by MemFabric.
+                src.data_ptr(), source_gva, source_bytes, bm.BmCopyType.L2G, stage_flags
             )
-            assert ret == 0, f"rank0 source offload failed, ret={ret}, err={mf.get_last_err_msg()}"
+            assert ret == 0, (
+                f"rank0 source staging with {args.source_stage_engine} failed, "
+                f"ret={ret}, err={mf.get_last_err_msg()}"
+            )
             torch.npu.synchronize()
         except Exception as exc:
             try:
@@ -457,7 +464,7 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
         control_connection = None
         print(
             f"[rank 0] source staged in DRAM GVA={_hex(source_gva)}; "
-            "holding pool for rank1 (Ctrl+C to exit)",
+            f"engine={args.source_stage_engine}; holding pool for rank1 (Ctrl+C to exit)",
             flush=True,
         )
 
@@ -626,6 +633,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pool-bytes", type=int, default=ONE_GIB)
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="bfloat16")
     parser.add_argument("--src-meta-device", choices=("cpu", "meta"), default="cpu")
+    parser.add_argument(
+        "--source-stage-engine",
+        choices=("sdma", "mte"),
+        default="sdma",
+        help="rank0 source preload path; default sdma keeps MTE out of the unmeasured setup step",
+    )
     parser.add_argument("--topks", type=_parse_topks, default=TOPKS)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup", type=int, default=2)
