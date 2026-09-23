@@ -17,8 +17,8 @@ source pattern after every (topk, method) measurement.
 After the sparse sweep, rank1 also runs dense 1 GiB ``copy_data`` measurements
 for SDMA and MTE in both directions:
 
-* RD2H: rank0 remote DRAM GVA -> rank1 local HBM;
-* RH2D: rank0 remote HBM GVA -> rank1 local DRAM GVA.
+* RH2D: rank0 remote Host DRAM GVA -> rank1 local Device HBM;
+* RD2H: rank0 remote Device HBM GVA -> rank1 local Host DRAM GVA.
 
 Each timed call submits one contiguous 1 GiB copy; the single-copy MTE path
 internally distributes that range to AI Core blocks.
@@ -365,7 +365,7 @@ def _initialize_bm(args: argparse.Namespace, rank: int) -> None:
 
 def _create_handle(args: argparse.Namespace, rank: int):
     store_url = f"tcp://{args.head_ip}:{args.store_port}"
-    # RH2D needs only rank0 to contribute a 1 GiB HBM segment.  Keeping rank1
+    # RD2H needs only rank0 to contribute a 1 GiB HBM segment.  Keeping rank1
     # at zero avoids reserving another 1 GiB of HBM that the destination does
     # not use, while the common maximum leaves the pool layout consistent.
     local_hbm_bytes = DENSE_COPY_BYTES if rank == 0 else 0
@@ -664,7 +664,7 @@ def _run_dense_copy_benchmark(
     args: argparse.Namespace,
     dtype: torch.dtype,
 ) -> list[DenseBenchResult]:
-    """Measure dense 1 GiB RD2H and RH2D copies for each MemFabric engine."""
+    """Measure dense 1 GiB RH2D and RD2H copies for each MemFabric engine."""
     dense_shape = _dense_shape(dtype)
     dense_bytes = _nbytes(dense_shape, dtype)
     if dense_bytes != DENSE_COPY_BYTES:
@@ -674,40 +674,19 @@ def _run_dense_copy_benchmark(
     results: list[DenseBenchResult] = []
     print(
         f"[rank 1] dense single-copy: bytes={dense_bytes / 2**30:.2f} GiB, one contiguous descriptor; "
-        f"RD2H dst={dense_shape}, RH2D dst=rank1 DRAM GVA={_hex(local_dram_gva)}",
+        f"RH2D dst={dense_shape}, RD2H dst=rank1 DRAM GVA={_hex(local_dram_gva)}",
         flush=True,
     )
 
     for method, flags in (("copy_data_sdma", 0), ("copy_data_mte", COPY_EXTEND_FLAG)):
-        def launch_rd2h(flags=flags) -> None:
+        # Remote Host (rank0 DRAM pool) -> local Device (rank1 NPU HBM).
+        # This is the RH2D direction in the MemFabric bandwidth table.
+        def launch_rh2d(flags=flags) -> None:
             ret = handle.copy_data(
                 dense_dram_gva,
                 dense_dst.data_ptr(),
                 dense_bytes,
                 bm.BmCopyType.G2L,
-                flags,
-            )
-            assert ret == 0, (
-                f"RD2H {method} failed, ret={ret}, err={mf.get_last_err_msg()}"
-            )
-
-        try:
-            avg_us, bandwidth_gbs = _measure(
-                launch_rd2h, args.warmup, args.iters, dense_bytes
-            )
-            _assert_dense_pattern(dense_dst, dtype, f"RD2H dense 1 GiB {method}")
-            results.append(DenseBenchResult("RD2H", dense_bytes, method, avg_us, bandwidth_gbs))
-        except Exception as exc:
-            detail = f"{type(exc).__name__}: {exc}"
-            print(f"[rank 1] RD2H dense 1 GiB {method}: N/A ({detail})", flush=True)
-            results.append(DenseBenchResult("RD2H", dense_bytes, method, None, None, detail))
-
-        def launch_rh2d(flags=flags) -> None:
-            ret = handle.copy_data(
-                remote_hbm_gva,
-                local_dram_gva,
-                dense_bytes,
-                bm.BmCopyType.G2G,
                 flags,
             )
             assert ret == 0, (
@@ -718,6 +697,30 @@ def _run_dense_copy_benchmark(
             avg_us, bandwidth_gbs = _measure(
                 launch_rh2d, args.warmup, args.iters, dense_bytes
             )
+            _assert_dense_pattern(dense_dst, dtype, f"RH2D dense 1 GiB {method}")
+            results.append(DenseBenchResult("RH2D", dense_bytes, method, avg_us, bandwidth_gbs))
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            print(f"[rank 1] RH2D dense 1 GiB {method}: N/A ({detail})", flush=True)
+            results.append(DenseBenchResult("RH2D", dense_bytes, method, None, None, detail))
+
+        # Remote Device (rank0 HBM pool) -> local Host (rank1 DRAM pool).
+        def launch_rd2h(flags=flags) -> None:
+            ret = handle.copy_data(
+                remote_hbm_gva,
+                local_dram_gva,
+                dense_bytes,
+                bm.BmCopyType.G2G,
+                flags,
+            )
+            assert ret == 0, (
+                f"RD2H {method} failed, ret={ret}, err={mf.get_last_err_msg()}"
+            )
+
+        try:
+            avg_us, bandwidth_gbs = _measure(
+                launch_rd2h, args.warmup, args.iters, dense_bytes
+            )
             verify_ret = handle.copy_data(
                 local_dram_gva,
                 dense_dst.data_ptr(),
@@ -726,15 +729,15 @@ def _run_dense_copy_benchmark(
                 0,
             )
             assert verify_ret == 0, (
-                f"RH2D {method} verification readback failed, ret={verify_ret}, "
+                f"RD2H {method} verification readback failed, ret={verify_ret}, "
                 f"err={mf.get_last_err_msg()}"
             )
-            _assert_dense_pattern(dense_dst, dtype, f"RH2D dense 1 GiB {method}")
-            results.append(DenseBenchResult("RH2D", dense_bytes, method, avg_us, bandwidth_gbs))
+            _assert_dense_pattern(dense_dst, dtype, f"RD2H dense 1 GiB {method}")
+            results.append(DenseBenchResult("RD2H", dense_bytes, method, avg_us, bandwidth_gbs))
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
-            print(f"[rank 1] RH2D dense 1 GiB {method}: N/A ({detail})", flush=True)
-            results.append(DenseBenchResult("RH2D", dense_bytes, method, None, None, detail))
+            print(f"[rank 1] RD2H dense 1 GiB {method}: N/A ({detail})", flush=True)
+            results.append(DenseBenchResult("RD2H", dense_bytes, method, None, None, detail))
 
     return results
 
