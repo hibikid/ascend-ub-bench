@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -46,7 +47,11 @@ NUM_HEADS = 1
 HEAD_DIM = 576
 TOPKS = (64, 128, 256, 512, 1024, 2048)
 READY_BLOCK_BYTES = 64
-SOURCE_READY_MAGIC = 0x39A6C1E5
+PEER_READY_MAGIC = 0x51DE9A7E
+CONTROL_PEER_READY = b"PEER_READY\n"
+CONTROL_SOURCE_READY = b"SOURCE_READY\n"
+CONTROL_SOURCE_FAILED = b"SOURCE_FAILED "
+MAX_CONTROL_LINE_BYTES = 1024
 
 DTYPES = {
     "bfloat16": torch.bfloat16,
@@ -279,52 +284,110 @@ def _cleanup(handle, bm_inited: bool, joined: bool) -> None:
         mf.uninitialize()
 
 
-def _write_source_marker(
-    handle,
-    source_gva: int,
-    pool_bytes: int,
-    device: str,
-    marker_value: int,
-) -> None:
-    """Write a 64-byte source-state marker in rank0's reserved pool tail."""
-    marker = torch.zeros(READY_BLOCK_BYTES // 4, dtype=torch.int32, device=device)
-    marker[0] = marker_value
-    torch.npu.synchronize()
-    slot = source_gva + pool_bytes - READY_BLOCK_BYTES
-    ret = handle.copy_data(
-        marker.data_ptr(), slot, READY_BLOCK_BYTES, bm.BmCopyType.L2GH, COPY_EXTEND_FLAG
-    )
-    assert ret == 0, f"source-ready marker write failed, ret={ret}, err={mf.get_last_err_msg()}"
-    torch.npu.synchronize()
-
-
-def _wait_for_source_ready(
+def _send_peer_ready(
     handle,
     peer_gva: int,
     pool_bytes: int,
     device: str,
     timeout: float,
 ) -> None:
-    """Wait until rank0 both maps and fills its remote DRAM source slice."""
-    marker = torch.empty(READY_BLOCK_BYTES // 4, dtype=torch.int32, device=device)
+    """Confirm that rank0's DRAM slice is mapped on rank1.
+
+    This deliberately follows microbench_sdma_mte.py: rank1 retries a small
+    L2G write with SDMA first and MTE as fallback.  A successful write proves
+    that rank1 can access rank0's GVA; the MemFabric group barrier also makes
+    this the point at which rank0's view of rank1 has completed.
+    """
+    marker = torch.zeros(READY_BLOCK_BYTES // 4, dtype=torch.int32, device=device)
+    marker[0] = PEER_READY_MAGIC
+    torch.npu.synchronize()
     slot = peer_gva + pool_bytes - READY_BLOCK_BYTES
     deadline = time.monotonic() + timeout
     attempt = 0
     while time.monotonic() < deadline:
         attempt += 1
-        ret = handle.copy_data(slot, marker.data_ptr(), READY_BLOCK_BYTES, bm.BmCopyType.G2L, 0)
+        ret = handle.copy_data(marker.data_ptr(), slot, READY_BLOCK_BYTES, bm.BmCopyType.L2G, 0)
         if ret != 0:
             ret = handle.copy_data(
-                slot, marker.data_ptr(), READY_BLOCK_BYTES, bm.BmCopyType.G2L, COPY_EXTEND_FLAG
+                marker.data_ptr(), slot, READY_BLOCK_BYTES, bm.BmCopyType.L2G, COPY_EXTEND_FLAG
             )
         if ret == 0:
             torch.npu.synchronize()
-            if int(marker[0].item()) == SOURCE_READY_MAGIC:
-                print(f"[rank 1] rank0 source ready after {attempt} poll(s)", flush=True)
-                return
+            print(f"[rank 1] peer GVA ready after {attempt} attempt(s)", flush=True)
+            return
         time.sleep(0.2)
     raise TimeoutError(
-        f"timed out after {timeout}s waiting for rank0 source-ready marker at {_hex(slot)}"
+        f"timed out after {timeout}s writing peer-ready marker to rank0 DRAM at {_hex(slot)}"
+    )
+
+
+def _recv_control_line(connection: socket.socket) -> bytes:
+    """Receive one bounded newline-terminated control message."""
+    payload = bytearray()
+    while len(payload) < MAX_CONTROL_LINE_BYTES:
+        chunk = connection.recv(256)
+        if not chunk:
+            break
+        payload.extend(chunk)
+        if b"\n" in chunk:
+            break
+    line, separator, _remainder = bytes(payload).partition(b"\n")
+    if len(payload) >= MAX_CONTROL_LINE_BYTES and not separator:
+        raise RuntimeError("control message exceeds maximum length")
+    return line
+
+
+def _create_rank0_control_listener(control_port: int) -> socket.socket:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", control_port))
+    listener.listen(1)
+    return listener
+
+
+def _wait_for_rank1_peer_ready(
+    listener: socket.socket,
+    timeout: float,
+) -> socket.socket:
+    """Wait for rank1's control acknowledgement after its data-plane probe."""
+    listener.settimeout(timeout)
+    try:
+        connection, peer = listener.accept()
+    except socket.timeout as exc:
+        raise TimeoutError(f"timed out after {timeout}s waiting for rank1 control connection") from exc
+    connection.settimeout(timeout)
+    message = _recv_control_line(connection)
+    if message != CONTROL_PEER_READY.rstrip(b"\n"):
+        connection.close()
+        raise RuntimeError(f"unexpected rank1 control message: {message!r}")
+    print(f"[rank 0] received PEER_READY control signal from {peer[0]}:{peer[1]}", flush=True)
+    return connection
+
+
+def _request_source_staging(head_ip: str, control_port: int, timeout: float) -> None:
+    """Tell rank0 that the data-plane map is ready, then await source staging."""
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        remaining = max(0.1, deadline - time.monotonic())
+        try:
+            with socket.create_connection((head_ip, control_port), timeout=min(2.0, remaining)) as connection:
+                connection.settimeout(remaining)
+                connection.sendall(CONTROL_PEER_READY)
+                message = _recv_control_line(connection)
+                if message == CONTROL_SOURCE_READY.rstrip(b"\n"):
+                    print("[rank 1] rank0 source staging confirmed", flush=True)
+                    return
+                if message.startswith(CONTROL_SOURCE_FAILED):
+                    detail = message[len(CONTROL_SOURCE_FAILED):].decode("utf-8", errors="replace")
+                    raise RuntimeError(f"rank0 source staging failed: {detail}")
+                raise RuntimeError(f"unexpected rank0 control message: {message!r}")
+        except (ConnectionRefusedError, TimeoutError, socket.timeout, OSError) as exc:
+            last_error = exc
+            time.sleep(0.2)
+    raise TimeoutError(
+        f"timed out after {timeout}s waiting for rank0 control listener "
+        f"at {head_ip}:{control_port}; last error: {last_error}"
     )
 
 
@@ -341,32 +404,53 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
     handle = None
     bm_inited = False
     joined = False
+    control_listener = None
+    control_connection = None
     try:
         _initialize_bm(args, rank=0)
         bm_inited = True
+        control_listener = _create_rank0_control_listener(args.control_port)
+        print(
+            f"[rank 0] control listener ready on 0.0.0.0:{args.control_port}",
+            flush=True,
+        )
         handle = _create_handle(args, rank=0)
         joined = True
 
         source_gva = handle.peer_rank_ptr(0, bm.BmMemType.HOST)
         assert source_gva != 0, "peer_rank_ptr(rank=0, HOST) returned 0"
-        # A fresh pool is not required to be zeroed.  Clear the reserved tail
-        # before rank1 is allowed to observe a ready value from an old run.
-        _write_source_marker(handle, source_gva, args.pool_bytes, args.device, marker_value=0)
         print(
             f"[rank 0] building source shape={src_shape}, dtype={args.dtype}, "
             f"bytes={source_bytes} ({source_bytes / 2**20:.2f} MiB)",
             flush=True,
         )
         src = _build_rank0_kv(args.device, dtype)
+        print(
+            "[rank 0] source tensor is ready on NPU; waiting for rank1 peer-ready signal "
+            "before staging it into DRAM",
+            flush=True,
+        )
+        control_connection = _wait_for_rank1_peer_ready(control_listener, args.control_timeout)
 
-        ret = handle.copy_data(
-            src.data_ptr(), source_gva, source_bytes, bm.BmCopyType.L2GH, COPY_EXTEND_FLAG
-        )
-        assert ret == 0, f"rank0 source offload failed, ret={ret}, err={mf.get_last_err_msg()}"
-        torch.npu.synchronize()
-        _write_source_marker(
-            handle, source_gva, args.pool_bytes, args.device, marker_value=SOURCE_READY_MAGIC
-        )
+        try:
+            ret = handle.copy_data(
+                src.data_ptr(), source_gva, source_bytes, bm.BmCopyType.L2GH, COPY_EXTEND_FLAG
+            )
+            assert ret == 0, f"rank0 source offload failed, ret={ret}, err={mf.get_last_err_msg()}"
+            torch.npu.synchronize()
+        except Exception as exc:
+            try:
+                control_connection.sendall(
+                    CONTROL_SOURCE_FAILED + str(exc).encode("utf-8", errors="replace") + b"\n"
+                )
+            finally:
+                control_connection.close()
+                control_connection = None
+            raise
+
+        control_connection.sendall(CONTROL_SOURCE_READY)
+        control_connection.close()
+        control_connection = None
         print(
             f"[rank 0] source staged in DRAM GVA={_hex(source_gva)}; "
             "holding pool for rank1 (Ctrl+C to exit)",
@@ -382,6 +466,10 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
             except KeyboardInterrupt:
                 print("[rank 0] interrupted", flush=True)
     finally:
+        if control_connection is not None:
+            control_connection.close()
+        if control_listener is not None:
+            control_listener.close()
         _cleanup(handle, bm_inited, joined)
     print("[rank 0] cleanup done", flush=True)
 
@@ -407,7 +495,8 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
         peer_gva = handle.peer_rank_ptr(0, bm.BmMemType.HOST)
         assert peer_gva != 0, "peer_rank_ptr(rank=0, HOST) returned 0"
         print(f"[rank 1] rank0 source GVA={_hex(peer_gva)}", flush=True)
-        _wait_for_source_ready(handle, peer_gva, args.pool_bytes, args.device, args.ready_timeout)
+        _send_peer_ready(handle, peer_gva, args.pool_bytes, args.device, args.ready_timeout)
+        _request_source_staging(args.head_ip, args.control_port, args.control_timeout)
 
         src_lva = handle.gva_to_va(peer_gva, bm.BmMemType.LOCAL_DEVICE)
         assert src_lva != 0, f"gva_to_va({_hex(peer_gva)}, LOCAL_DEVICE) failed"
@@ -538,6 +627,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--ready-timeout", type=float, default=120.0)
+    parser.add_argument("--control-port", type=int, default=STORE_PORT + 1)
+    parser.add_argument("--control-timeout", type=float, default=180.0)
     parser.add_argument("--rank0-hold-sec", type=float, default=0.0)
     parser.add_argument("--log-level", type=int, default=3)
     args = parser.parse_args()
@@ -552,6 +643,10 @@ def _parse_args() -> argparse.Namespace:
         raise RuntimeError("--warmup must be >= 0 and --iters must be > 0")
     if args.ready_timeout <= 0:
         raise RuntimeError("--ready-timeout must be > 0")
+    if not 1 <= args.control_port <= 65535:
+        raise RuntimeError("--control-port must be in [1, 65535]")
+    if args.control_timeout <= 0:
+        raise RuntimeError("--control-timeout must be > 0")
 
     args.device = "npu"
     return args
