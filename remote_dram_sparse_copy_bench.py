@@ -14,10 +14,14 @@ tokens through four paths:
 Only rank1 performs timed copies.  A result is checked against a deterministic
 source pattern after every (topk, method) measurement.
 
-After the sparse sweep, rank1 also runs dense 1 GiB G2L ``copy_data``
-measurements for SDMA and MTE.  Each timed call submits one contiguous 1 GiB
-copy; the single-copy MTE path internally distributes that range to AI Core
-blocks.
+After the sparse sweep, rank1 also runs dense 1 GiB ``copy_data`` measurements
+for SDMA and MTE in both directions:
+
+* RD2H: rank0 remote DRAM GVA -> rank1 local HBM;
+* RH2D: rank0 remote HBM GVA -> rank1 local DRAM GVA.
+
+Each timed call submits one contiguous 1 GiB copy; the single-copy MTE path
+internally distributes that range to AI Core blocks.
 """
 
 from __future__ import annotations
@@ -80,6 +84,7 @@ class BenchResult:
 
 @dataclass
 class DenseBenchResult:
+    direction: str
     total_bytes: int
     method: str
     avg_us: float | None
@@ -360,15 +365,23 @@ def _initialize_bm(args: argparse.Namespace, rank: int) -> None:
 
 def _create_handle(args: argparse.Namespace, rank: int):
     store_url = f"tcp://{args.head_ip}:{args.store_port}"
+    # RH2D needs only rank0 to contribute a 1 GiB HBM segment.  Keeping rank1
+    # at zero avoids reserving another 1 GiB of HBM that the destination does
+    # not use, while the common maximum leaves the pool layout consistent.
+    local_hbm_bytes = DENSE_COPY_BYTES if rank == 0 else 0
     handle = bm.create2(
         id=args.pool_id,
         local_dram_size=args.pool_bytes,
         max_dram_size=args.pool_bytes,
-        local_hbm_size=0,
-        max_hbm_size=0,
+        local_hbm_size=local_hbm_bytes,
+        max_hbm_size=DENSE_COPY_BYTES,
         data_op_type=DATA_OP_TYPE,
     )
-    print(f"[rank {rank}] joining pool via {store_url}", flush=True)
+    print(
+        f"[rank {rank}] joining pool via {store_url} "
+        f"(DRAM={args.pool_bytes / 2**30:.2f} GiB, HBM={local_hbm_bytes / 2**30:.2f} GiB)",
+        flush=True,
+    )
     assert handle is not None, "bm.create2 failed"
     assert handle.join() == 0, "pool join failed"
     return handle
@@ -426,6 +439,22 @@ def _send_peer_ready(
         time.sleep(0.2)
     raise TimeoutError(
         f"timed out after {timeout}s writing peer-ready marker to rank0 DRAM at {_hex(slot)}"
+    )
+
+
+def _wait_for_peer_hbm_mapping(handle, peer_hbm_gva: int, timeout: float) -> int:
+    """Wait until rank0's HBM GVA is mapped into rank1's local device VA space."""
+    deadline = time.monotonic() + timeout
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        peer_hbm_lva = handle.gva_to_va(peer_hbm_gva, bm.BmMemType.LOCAL_DEVICE)
+        if peer_hbm_lva != 0:
+            print(f"[rank 1] peer HBM GVA ready after {attempt} attempt(s)", flush=True)
+            return peer_hbm_lva
+        time.sleep(0.2)
+    raise TimeoutError(
+        f"timed out after {timeout}s mapping rank0 HBM GVA {_hex(peer_hbm_gva)} into local device VA"
     )
 
 
@@ -532,6 +561,8 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
         source_gva = handle.peer_rank_ptr(0, bm.BmMemType.HOST)
         assert source_gva != 0, "peer_rank_ptr(rank=0, HOST) returned 0"
         dense_gva = source_gva + source_bytes
+        dense_hbm_gva = handle.peer_rank_ptr(0, bm.BmMemType.DEVICE)
+        assert dense_hbm_gva != 0, "peer_rank_ptr(rank=0, DEVICE) returned 0"
         print(
             f"[rank 0] building sparse source shape={src_shape}, dtype={args.dtype}, "
             f"bytes={source_bytes} ({source_bytes / 2**20:.2f} MiB); "
@@ -576,6 +607,15 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
                 f"ret={ret}, err={mf.get_last_err_msg()}"
             )
             torch.npu.synchronize()
+
+            ret = handle.copy_data(
+                dense_src.data_ptr(), dense_hbm_gva, dense_bytes, bm.BmCopyType.L2G, stage_flags
+            )
+            assert ret == 0, (
+                f"rank0 dense HBM source staging with {args.source_stage_engine} failed, "
+                f"ret={ret}, err={mf.get_last_err_msg()}"
+            )
+            torch.npu.synchronize()
             del dense_src
             torch.npu.empty_cache()
         except Exception as exc:
@@ -592,8 +632,9 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
         control_connection.close()
         control_connection = None
         print(
-            f"[rank 0] sparse source staged at GVA={_hex(source_gva)}, dense 1 GiB source at "
-            f"GVA={_hex(dense_gva)}; engine={args.source_stage_engine}; "
+            f"[rank 0] sparse source staged at DRAM GVA={_hex(source_gva)}, dense 1 GiB sources at "
+            f"DRAM GVA={_hex(dense_gva)} and HBM GVA={_hex(dense_hbm_gva)}; "
+            f"engine={args.source_stage_engine}; "
             "holding pool for rank1 (Ctrl+C to exit)",
             flush=True,
         )
@@ -617,11 +658,13 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
 
 def _run_dense_copy_benchmark(
     handle,
-    dense_gva: int,
+    dense_dram_gva: int,
+    remote_hbm_gva: int,
+    local_dram_gva: int,
     args: argparse.Namespace,
     dtype: torch.dtype,
 ) -> list[DenseBenchResult]:
-    """Measure one contiguous 1 GiB dense G2L copy for each MemFabric engine."""
+    """Measure dense 1 GiB RD2H and RH2D copies for each MemFabric engine."""
     dense_shape = _dense_shape(dtype)
     dense_bytes = _nbytes(dense_shape, dtype)
     if dense_bytes != DENSE_COPY_BYTES:
@@ -630,34 +673,68 @@ def _run_dense_copy_benchmark(
     dense_dst = torch.empty(dense_shape, dtype=dtype, device=args.device).contiguous()
     results: list[DenseBenchResult] = []
     print(
-        f"[rank 1] dense single-copy: bytes={dense_bytes / 2**30:.2f} GiB, "
-        f"one contiguous descriptor, dst={dense_shape}",
+        f"[rank 1] dense single-copy: bytes={dense_bytes / 2**30:.2f} GiB, one contiguous descriptor; "
+        f"RD2H dst={dense_shape}, RH2D dst=rank1 DRAM GVA={_hex(local_dram_gva)}",
         flush=True,
     )
 
     for method, flags in (("copy_data_sdma", 0), ("copy_data_mte", COPY_EXTEND_FLAG)):
-        def launch_dense_copy(flags=flags) -> None:
+        def launch_rd2h(flags=flags) -> None:
             ret = handle.copy_data(
-                dense_gva,
+                dense_dram_gva,
                 dense_dst.data_ptr(),
                 dense_bytes,
                 bm.BmCopyType.G2L,
                 flags,
             )
             assert ret == 0, (
-                f"dense {method} failed, ret={ret}, err={mf.get_last_err_msg()}"
+                f"RD2H {method} failed, ret={ret}, err={mf.get_last_err_msg()}"
             )
 
         try:
             avg_us, bandwidth_gbs = _measure(
-                launch_dense_copy, args.warmup, args.iters, dense_bytes
+                launch_rd2h, args.warmup, args.iters, dense_bytes
             )
-            _assert_dense_pattern(dense_dst, dtype, f"dense 1 GiB {method}")
-            results.append(DenseBenchResult(dense_bytes, method, avg_us, bandwidth_gbs))
+            _assert_dense_pattern(dense_dst, dtype, f"RD2H dense 1 GiB {method}")
+            results.append(DenseBenchResult("RD2H", dense_bytes, method, avg_us, bandwidth_gbs))
         except Exception as exc:
             detail = f"{type(exc).__name__}: {exc}"
-            print(f"[rank 1] dense 1 GiB {method}: N/A ({detail})", flush=True)
-            results.append(DenseBenchResult(dense_bytes, method, None, None, detail))
+            print(f"[rank 1] RD2H dense 1 GiB {method}: N/A ({detail})", flush=True)
+            results.append(DenseBenchResult("RD2H", dense_bytes, method, None, None, detail))
+
+        def launch_rh2d(flags=flags) -> None:
+            ret = handle.copy_data(
+                remote_hbm_gva,
+                local_dram_gva,
+                dense_bytes,
+                bm.BmCopyType.G2G,
+                flags,
+            )
+            assert ret == 0, (
+                f"RH2D {method} failed, ret={ret}, err={mf.get_last_err_msg()}"
+            )
+
+        try:
+            avg_us, bandwidth_gbs = _measure(
+                launch_rh2d, args.warmup, args.iters, dense_bytes
+            )
+            verify_ret = handle.copy_data(
+                local_dram_gva,
+                dense_dst.data_ptr(),
+                dense_bytes,
+                bm.BmCopyType.G2L,
+                0,
+            )
+            assert verify_ret == 0, (
+                f"RH2D {method} verification readback failed, ret={verify_ret}, "
+                f"err={mf.get_last_err_msg()}"
+            )
+            _assert_dense_pattern(dense_dst, dtype, f"RH2D dense 1 GiB {method}")
+            results.append(DenseBenchResult("RH2D", dense_bytes, method, avg_us, bandwidth_gbs))
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            print(f"[rank 1] RH2D dense 1 GiB {method}: N/A ({detail})", flush=True)
+            results.append(DenseBenchResult("RH2D", dense_bytes, method, None, None, detail))
 
     return results
 
@@ -683,7 +760,11 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
 
         peer_gva = handle.peer_rank_ptr(0, bm.BmMemType.HOST)
         assert peer_gva != 0, "peer_rank_ptr(rank=0, HOST) returned 0"
-        dense_gva = peer_gva + _nbytes(src_shape, dtype)
+        dense_dram_gva = peer_gva + _nbytes(src_shape, dtype)
+        remote_hbm_gva = handle.peer_rank_ptr(0, bm.BmMemType.DEVICE)
+        assert remote_hbm_gva != 0, "peer_rank_ptr(rank=0, DEVICE) returned 0"
+        local_dram_gva = handle.peer_rank_ptr(1, bm.BmMemType.HOST)
+        assert local_dram_gva != 0, "peer_rank_ptr(rank=1, HOST) returned 0"
         required_pool_bytes = _nbytes(src_shape, dtype) + DENSE_COPY_BYTES + READY_BLOCK_BYTES
         if required_pool_bytes > args.pool_bytes:
             raise RuntimeError(
@@ -692,6 +773,7 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
             )
         print(f"[rank 1] rank0 source GVA={_hex(peer_gva)}", flush=True)
         _send_peer_ready(handle, peer_gva, args.pool_bytes, args.device, args.ready_timeout)
+        _wait_for_peer_hbm_mapping(handle, remote_hbm_gva, args.ready_timeout)
         _request_source_staging(args.head_ip, args.control_port, args.control_timeout)
 
         src_lva = handle.gva_to_va(peer_gva, bm.BmMemType.LOCAL_DEVICE)
@@ -797,7 +879,9 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
                 _assert_equal(dst, expected, f"topk={topk} {method}")
                 results.append(BenchResult(topk, total_bytes, method, avg_us, bandwidth_gbs))
 
-        dense_results = _run_dense_copy_benchmark(handle, dense_gva, args, dtype)
+        dense_results = _run_dense_copy_benchmark(
+            handle, dense_dram_gva, remote_hbm_gva, local_dram_gva, args, dtype
+        )
     finally:
         _cleanup(handle, bm_inited, joined)
 
@@ -836,12 +920,12 @@ def _print_results(results: list[BenchResult], dtype_name: str, iters: int) -> N
 
 def _print_dense_results(results: list[DenseBenchResult], dtype_name: str, iters: int) -> None:
     print(
-        "\nremote DRAM dense 1 GiB single-copy benchmark "
+        "\nremote dense 1 GiB single-copy benchmark "
         f"(dtype={dtype_name}, timed iterations={iters}, all bytes verified)",
         flush=True,
     )
     print(
-        f"{'bytes(GiB)':>12} {'method':<24} {'avg(us)':>12} {'BW(GB/s)':>12}  status",
+        f"{'direction':<8} {'bytes(GiB)':>12} {'method':<24} {'avg(us)':>12} {'BW(GB/s)':>12}  status",
         flush=True,
     )
     print("-" * 112, flush=True)
@@ -850,7 +934,7 @@ def _print_dense_results(results: list[DenseBenchResult], dtype_name: str, iters
         bandwidth_gbs = f"{row.bandwidth_gbs:.2f}" if row.bandwidth_gbs is not None else "N/A"
         status = "OK" if row.error is None else f"N/A ({row.error})"
         print(
-            f"{row.total_bytes / 2**30:>12.3f} {row.method:<24} "
+            f"{row.direction:<8} {row.total_bytes / 2**30:>12.3f} {row.method:<24} "
             f"{avg_us:>12} {bandwidth_gbs:>12}  {status}",
             flush=True,
         )
