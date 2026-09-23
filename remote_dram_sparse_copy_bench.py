@@ -80,42 +80,46 @@ def _arange_on_device(end: int, dtype: torch.dtype, device: str) -> torch.Tensor
     return torch.arange(end, dtype=dtype, device=device)
 
 
-def _stream_ptr(stream) -> int:
-    """Extract the raw aclrtStream pointer, matching UniDexCopy's Python wrapper."""
-    for attr in ("npu_stream", "stream_ptr", "cuda_stream"):
-        if hasattr(stream, attr):
-            value = getattr(stream, attr)
-            return int(value() if callable(value) else value)
-    raise RuntimeError("Unable to extract a raw stream pointer from torch NPU stream")
+def _load_unidex_copy_inplace():
+    """Load SGLang's public UniDexCopy wrapper.
 
-
-def _load_unidex_copy_raw():
-    """Load the raw UniDexCopy launcher used inside unidex_copy_inplace.
-
-    The high-level wrapper prints its complete launch configuration for every
-    call.  The raw API launches the same ``unidex_copy`` kernel without that
-    debug output, so host-side printing cannot contaminate the timed region.
+    The production sparse-KV manager uses this interface with a CPU host-KV
+    tensor for layout metadata and ``src_ptr`` for the real device-visible
+    source address.  Recent sgl_kernel_npu packages intentionally do not
+    export the older raw launcher, so this is also the portable benchmark API.
     """
     try:
-        from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace_raw
+        from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
 
-        return unidex_copy_inplace_raw
+        return unidex_copy_inplace
     except Exception as first_exc:
         repo_root = Path(__file__).resolve().parent.parent
         fallback_dir = repo_root / "indexcopy" / "unindexcopykernel"
         if str(fallback_dir) not in sys.path:
             sys.path.insert(0, str(fallback_dir))
         try:
-            from unindexcopykernel import unidex_copy_inplace_raw
+            from unindexcopykernel import unidex_copy_inplace
 
-            return unidex_copy_inplace_raw
+            return unidex_copy_inplace
         except Exception as second_exc:
             raise ImportError(
-                "Failed to import unidex_copy_inplace_raw from "
+                "Failed to import unidex_copy_inplace from "
                 "sgl_kernel_npu.sparsity_driven_kv_offload or local fallback "
-                f"{fallback_dir}.  The raw launcher is required to benchmark "
-                "UniDexCopy without debug-print overhead."
+                f"{fallback_dir}."
             ) from second_exc
+
+
+def _make_src_meta_tensor(shape: tuple[int, ...], dtype: torch.dtype, device_kind: str) -> torch.Tensor:
+    """Create the source-layout tensor consumed by the public UniDexCopy API.
+
+    The source bytes are never read from this tensor because ``src_ptr`` points
+    at rank0 DRAM.  ``cpu`` is the default because it exactly matches the
+    host-KV tensor passed by SGLang's production sparse-KV manager.  ``meta``
+    is offered only for wrappers that explicitly support shape-only metadata.
+    """
+    if device_kind == "meta":
+        return torch.empty(shape, dtype=dtype, device="meta")
+    return torch.empty(shape, dtype=dtype, device="cpu").contiguous()
 
 
 def _make_kv_values(
@@ -475,10 +479,9 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
 
 
 def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
-    unidex_copy_raw = _load_unidex_copy_raw()
+    unidex_copy_inplace = _load_unidex_copy_inplace()
     src_shape = (BATCH, SRC_SEQ, NUM_HEADS, HEAD_DIM)
     row_bytes = _nbytes((1, NUM_HEADS, HEAD_DIM), dtype)
-    src_rows = BATCH * SRC_SEQ
 
     mf.set_log_level(args.log_level)
     assert mf.initialize() == 0, "mf.initialize failed"
@@ -501,13 +504,13 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
         src_lva = handle.gva_to_va(peer_gva, bm.BmMemType.LOCAL_DEVICE)
         assert src_lva != 0, f"gva_to_va({_hex(peer_gva)}, LOCAL_DEVICE) failed"
         print(f"[rank 1] UniDexCopy source LVA={_hex(src_lva)}", flush=True)
+        src_meta = _make_src_meta_tensor(src_shape, dtype, args.src_meta_device)
         print(
             f"[rank 1] source={src_shape}, dtype={args.dtype}, row_bytes={row_bytes}, "
-            f"warmup={args.warmup}, iters={args.iters}",
+            f"src_meta_device={args.src_meta_device}, warmup={args.warmup}, iters={args.iters}",
             flush=True,
         )
 
-        stream_ptr = _stream_ptr(torch.npu.current_stream())
         batch_ids = _arange_on_device(BATCH, torch.long, args.device)
         for topk in args.topks:
             total_rows = BATCH * topk
@@ -558,19 +561,19 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
                 dst = torch.empty(dst_shape, dtype=dtype, device=args.device).contiguous()
 
                 def launch_unidex(dst=dst, block_dim=block_dim) -> None:
-                    unidex_copy_raw(
-                        src_ptr=src_lva,
-                        dst_ptr=dst.data_ptr(),
-                        src_index_ptr=src_index.data_ptr(),
-                        dst_index_ptr=dst_index.data_ptr(),
-                        valid_mask_ptr=valid_mask.data_ptr(),
-                        src_rows=src_rows,
-                        dst_rows=total_rows,
-                        block_bytes=row_bytes,
-                        max_copy=total_rows,
-                        stream_ptr=stream_ptr,
+                    # Mirrors SGLang SparseKVCacheManager: source layout comes
+                    # from a CPU host-KV tensor while src_ptr is the actual
+                    # device-visible address (here: rank0 remote DRAM LVA).
+                    unidex_copy_inplace(
+                        src_meta,
+                        dst,
+                        src_index,
+                        dst_index,
+                        valid_mask,
+                        2,  # src: [batch, seq, head, dim]
+                        2,  # dst: [batch, topk, head, dim]
                         block_dim=block_dim,
-                        sync=False,
+                        src_ptr=src_lva,
                     )
 
                 avg_us, bandwidth_gbs = _measure(
@@ -622,6 +625,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pool-id", type=int, default=0)
     parser.add_argument("--pool-bytes", type=int, default=ONE_GIB)
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="bfloat16")
+    parser.add_argument("--src-meta-device", choices=("cpu", "meta"), default="cpu")
     parser.add_argument("--topks", type=_parse_topks, default=TOPKS)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup", type=int, default=2)
