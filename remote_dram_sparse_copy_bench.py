@@ -902,11 +902,11 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
 def _print_results(results: list[BenchResult], dtype_name: str, iters: int) -> None:
     print(
         "\nremote DRAM sparse KV copy benchmark "
-        f"(dtype={dtype_name}, timed iterations={iters}, all rows verified)",
+        f"(dtype={dtype_name}, timed iterations={iters}, latency=per-copy average, all rows verified)",
         flush=True,
     )
     print(
-        f"{'topk':>6} {'bytes(MiB)':>12} {'method':<24} {'avg(us)':>12} {'BW(GB/s)':>12}  status",
+        f"{'topk':>6} {'bytes(MiB)':>12} {'method':<24} {'latency(us)':>12} {'BW(GB/s)':>12}  status",
         flush=True,
     )
     print("-" * 112, flush=True)
@@ -924,11 +924,11 @@ def _print_results(results: list[BenchResult], dtype_name: str, iters: int) -> N
 def _print_dense_results(results: list[DenseBenchResult], dtype_name: str, iters: int) -> None:
     print(
         "\nremote dense 1 GiB single-copy benchmark "
-        f"(dtype={dtype_name}, timed iterations={iters}, all bytes verified)",
+        f"(dtype={dtype_name}, timed iterations={iters}, latency=per-copy average, all bytes verified)",
         flush=True,
     )
     print(
-        f"{'direction':<8} {'bytes(GiB)':>12} {'method':<24} {'avg(us)':>12} {'BW(GB/s)':>12}  status",
+        f"{'direction':<8} {'bytes(GiB)':>12} {'method':<24} {'latency(us)':>12} {'BW(GB/s)':>12}  status",
         flush=True,
     )
     print("-" * 112, flush=True)
