@@ -13,6 +13,11 @@ tokens through four paths:
 
 Only rank1 performs timed copies.  A result is checked against a deterministic
 source pattern after every (topk, method) measurement.
+
+After the sparse sweep, rank1 also runs dense 1 GiB G2L ``copy_data``
+measurements for SDMA and MTE.  Each timed call submits one contiguous 1 GiB
+copy; the single-copy MTE path internally distributes that range to AI Core
+blocks.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from memfabric_hybrid import bm
 
 WORLD_SIZE = 2
 ONE_GIB = 1 << 30
+DEFAULT_POOL_BYTES = 2 * ONE_GIB
 STORE_PORT = 8573
 DEFAULT_NIC_URL = "tcp://127.0.0.1:10005"
 DATA_OP_TYPE = bm.BmDataOpType.SDMA
@@ -46,6 +52,9 @@ SRC_SEQ = 32 * 1024
 NUM_HEADS = 1
 HEAD_DIM = 576
 TOPKS = (64, 128, 256, 512, 1024, 2048)
+DENSE_COPY_BYTES = ONE_GIB
+DENSE_PATTERN_BLOCK_BYTES = 64 * 1024
+DENSE_VERIFY_BLOCKS = 256
 READY_BLOCK_BYTES = 64
 PEER_READY_MAGIC = 0x51DE9A7E
 CONTROL_PEER_READY = b"PEER_READY\n"
@@ -62,6 +71,15 @@ DTYPES = {
 @dataclass
 class BenchResult:
     topk: int
+    total_bytes: int
+    method: str
+    avg_us: float | None
+    bandwidth_gbs: float | None
+    error: str | None = None
+
+
+@dataclass
+class DenseBenchResult:
     total_bytes: int
     method: str
     avg_us: float | None
@@ -167,6 +185,91 @@ def _build_rank0_kv(device: str, dtype: torch.dtype) -> torch.Tensor:
         src[batch_id:batch_id + 1].copy_(_make_kv_values(token_row, batch, dtype))
     torch.npu.synchronize()
     return src
+
+
+def _dense_shape(dtype: torch.dtype) -> tuple[int, ...]:
+    """Return a flat contiguous shape occupying exactly ``DENSE_COPY_BYTES``."""
+    element_size = torch.empty((), dtype=dtype).element_size()
+    if DENSE_COPY_BYTES % element_size != 0:
+        raise ValueError(f"{DENSE_COPY_BYTES} is not divisible by dtype size {element_size}")
+    return (DENSE_COPY_BYTES // element_size,)
+
+
+def _make_dense_pattern_blocks(
+    first_block: int,
+    block_count: int,
+    block_elements: int,
+    dtype: torch.dtype,
+    device: str,
+) -> torch.Tensor:
+    """Create a deterministic dense payload for a consecutive block range.
+
+    The four-element motif encodes both low and high bits of the 64 KiB block
+    id.  Verification can therefore validate every destination element in
+    bounded chunks without retaining another 1 GiB reference tensor on rank1.
+    """
+    block_ids = _arange_on_device(first_block + block_count, torch.int32, device)[first_block:]
+    lane = _arange_on_device(block_elements, torch.int32, device).remainder(4).reshape(1, -1)
+    low = block_ids.remainder(256).to(torch.float32).reshape(-1, 1)
+    high = torch.div(block_ids, 256, rounding_mode="floor").remainder(256).to(torch.float32).reshape(-1, 1)
+    mixed0 = (low * 17 + high * 13).remainder(251)
+    mixed1 = (low * 31 + high * 29 + 73).remainder(251)
+    return torch.where(
+        lane == 0,
+        low,
+        torch.where(lane == 1, high, torch.where(lane == 2, mixed0, mixed1)),
+    ).to(dtype)
+
+
+def _fill_dense_pattern(tensor: torch.Tensor, dtype: torch.dtype, device: str) -> None:
+    """Fill an exactly-1-GiB flat tensor with the bounded-memory pattern."""
+    element_size = tensor.element_size()
+    if DENSE_PATTERN_BLOCK_BYTES % element_size != 0:
+        raise ValueError("dense pattern block must align to the dtype element size")
+    block_elements = DENSE_PATTERN_BLOCK_BYTES // element_size
+    flat = tensor.reshape(-1)
+    if flat.numel() % block_elements != 0:
+        raise ValueError("dense tensor is not an integral number of pattern blocks")
+    block_count = flat.numel() // block_elements
+    for first_block in range(0, block_count, DENSE_VERIFY_BLOCKS):
+        current_blocks = min(DENSE_VERIFY_BLOCKS, block_count - first_block)
+        begin = first_block * block_elements
+        end = begin + current_blocks * block_elements
+        flat[begin:end].reshape(current_blocks, block_elements).copy_(
+            _make_dense_pattern_blocks(first_block, current_blocks, block_elements, dtype, device)
+        )
+    torch.npu.synchronize()
+
+
+def _assert_dense_pattern(actual: torch.Tensor, dtype: torch.dtype, label: str) -> None:
+    """Validate all 1 GiB using bounded-size expected-pattern chunks."""
+    element_size = actual.element_size()
+    if DENSE_PATTERN_BLOCK_BYTES % element_size != 0:
+        raise ValueError("dense pattern block must align to the dtype element size")
+    block_elements = DENSE_PATTERN_BLOCK_BYTES // element_size
+    flat = actual.reshape(-1)
+    if flat.numel() % block_elements != 0:
+        raise AssertionError(f"{label}: dense destination size is not pattern-block aligned")
+    block_count = flat.numel() // block_elements
+    device = str(actual.device)
+    for first_block in range(0, block_count, DENSE_VERIFY_BLOCKS):
+        current_blocks = min(DENSE_VERIFY_BLOCKS, block_count - first_block)
+        begin = first_block * block_elements
+        end = begin + current_blocks * block_elements
+        expected = _make_dense_pattern_blocks(
+            first_block, current_blocks, block_elements, dtype, device
+        )
+        actual_chunk = flat[begin:end].reshape(current_blocks, block_elements)
+        if torch.equal(actual_chunk, expected):
+            continue
+        mismatch = actual_chunk.ne(expected)
+        first = mismatch.nonzero(as_tuple=False)[0].cpu().tolist()
+        row, column = first
+        element_index = begin + row * block_elements + column
+        raise AssertionError(
+            f"{label}: dense-copy verification failed at element {element_index}; "
+            f"actual={actual_chunk[row, column].item()}, expected={expected[row, column].item()}"
+        )
 
 
 def _build_topk_indices(topk: int, seed: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -399,9 +502,13 @@ def _request_source_staging(head_ip: str, control_port: int, timeout: float) -> 
 def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
     src_shape = (BATCH, SRC_SEQ, NUM_HEADS, HEAD_DIM)
     source_bytes = _nbytes(src_shape, dtype)
-    if source_bytes + READY_BLOCK_BYTES > args.pool_bytes:
+    dense_shape = _dense_shape(dtype)
+    dense_bytes = _nbytes(dense_shape, dtype)
+    required_pool_bytes = source_bytes + dense_bytes + READY_BLOCK_BYTES
+    if required_pool_bytes > args.pool_bytes:
         raise RuntimeError(
-            f"pool_bytes={args.pool_bytes} cannot hold source={source_bytes} plus ready marker"
+            f"pool_bytes={args.pool_bytes} cannot hold sparse source={source_bytes}, "
+            f"dense source={dense_bytes}, and ready marker; need at least {required_pool_bytes} bytes"
         )
 
     mf.set_log_level(args.log_level)
@@ -424,9 +531,11 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
 
         source_gva = handle.peer_rank_ptr(0, bm.BmMemType.HOST)
         assert source_gva != 0, "peer_rank_ptr(rank=0, HOST) returned 0"
+        dense_gva = source_gva + source_bytes
         print(
-            f"[rank 0] building source shape={src_shape}, dtype={args.dtype}, "
-            f"bytes={source_bytes} ({source_bytes / 2**20:.2f} MiB)",
+            f"[rank 0] building sparse source shape={src_shape}, dtype={args.dtype}, "
+            f"bytes={source_bytes} ({source_bytes / 2**20:.2f} MiB); "
+            f"dense source shape={dense_shape}, bytes={dense_bytes / 2**30:.2f} GiB",
             flush=True,
         )
         src = _build_rank0_kv(args.device, dtype)
@@ -450,6 +559,25 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
                 f"ret={ret}, err={mf.get_last_err_msg()}"
             )
             torch.npu.synchronize()
+
+            # Rank0 no longer needs the sparse NPU source after it has been
+            # staged.  Release it before allocating the separate 1 GiB dense
+            # source, keeping rank0 HBM pressure bounded.
+            del src
+            torch.npu.empty_cache()
+
+            dense_src = torch.empty(dense_shape, dtype=dtype, device=args.device).contiguous()
+            _fill_dense_pattern(dense_src, dtype, args.device)
+            ret = handle.copy_data(
+                dense_src.data_ptr(), dense_gva, dense_bytes, bm.BmCopyType.L2G, stage_flags
+            )
+            assert ret == 0, (
+                f"rank0 dense source staging with {args.source_stage_engine} failed, "
+                f"ret={ret}, err={mf.get_last_err_msg()}"
+            )
+            torch.npu.synchronize()
+            del dense_src
+            torch.npu.empty_cache()
         except Exception as exc:
             try:
                 control_connection.sendall(
@@ -464,8 +592,9 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
         control_connection.close()
         control_connection = None
         print(
-            f"[rank 0] source staged in DRAM GVA={_hex(source_gva)}; "
-            f"engine={args.source_stage_engine}; holding pool for rank1 (Ctrl+C to exit)",
+            f"[rank 0] sparse source staged at GVA={_hex(source_gva)}, dense 1 GiB source at "
+            f"GVA={_hex(dense_gva)}; engine={args.source_stage_engine}; "
+            "holding pool for rank1 (Ctrl+C to exit)",
             flush=True,
         )
 
@@ -486,6 +615,53 @@ def _run_rank0(args: argparse.Namespace, dtype: torch.dtype) -> None:
     print("[rank 0] cleanup done", flush=True)
 
 
+def _run_dense_copy_benchmark(
+    handle,
+    dense_gva: int,
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+) -> list[DenseBenchResult]:
+    """Measure one contiguous 1 GiB dense G2L copy for each MemFabric engine."""
+    dense_shape = _dense_shape(dtype)
+    dense_bytes = _nbytes(dense_shape, dtype)
+    if dense_bytes != DENSE_COPY_BYTES:
+        raise AssertionError(f"dense source has {dense_bytes} bytes, expected {DENSE_COPY_BYTES}")
+
+    dense_dst = torch.empty(dense_shape, dtype=dtype, device=args.device).contiguous()
+    results: list[DenseBenchResult] = []
+    print(
+        f"[rank 1] dense single-copy: bytes={dense_bytes / 2**30:.2f} GiB, "
+        f"one contiguous descriptor, dst={dense_shape}",
+        flush=True,
+    )
+
+    for method, flags in (("copy_data_sdma", 0), ("copy_data_mte", COPY_EXTEND_FLAG)):
+        def launch_dense_copy(flags=flags) -> None:
+            ret = handle.copy_data(
+                dense_gva,
+                dense_dst.data_ptr(),
+                dense_bytes,
+                bm.BmCopyType.G2L,
+                flags,
+            )
+            assert ret == 0, (
+                f"dense {method} failed, ret={ret}, err={mf.get_last_err_msg()}"
+            )
+
+        try:
+            avg_us, bandwidth_gbs = _measure(
+                launch_dense_copy, args.warmup, args.iters, dense_bytes
+            )
+            _assert_dense_pattern(dense_dst, dtype, f"dense 1 GiB {method}")
+            results.append(DenseBenchResult(dense_bytes, method, avg_us, bandwidth_gbs))
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            print(f"[rank 1] dense 1 GiB {method}: N/A ({detail})", flush=True)
+            results.append(DenseBenchResult(dense_bytes, method, None, None, detail))
+
+    return results
+
+
 def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
     unidex_copy_inplace = _load_unidex_copy_inplace()
     src_shape = (BATCH, SRC_SEQ, NUM_HEADS, HEAD_DIM)
@@ -497,6 +673,7 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
     bm_inited = False
     joined = False
     results: list[BenchResult] = []
+    dense_results: list[DenseBenchResult] = []
     batch_mte_unavailable: str | None = None
     try:
         _initialize_bm(args, rank=1)
@@ -506,6 +683,13 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
 
         peer_gva = handle.peer_rank_ptr(0, bm.BmMemType.HOST)
         assert peer_gva != 0, "peer_rank_ptr(rank=0, HOST) returned 0"
+        dense_gva = peer_gva + _nbytes(src_shape, dtype)
+        required_pool_bytes = _nbytes(src_shape, dtype) + DENSE_COPY_BYTES + READY_BLOCK_BYTES
+        if required_pool_bytes > args.pool_bytes:
+            raise RuntimeError(
+                f"pool_bytes={args.pool_bytes} cannot hold sparse plus dense sources; "
+                f"need at least {required_pool_bytes} bytes"
+            )
         print(f"[rank 1] rank0 source GVA={_hex(peer_gva)}", flush=True)
         _send_peer_ready(handle, peer_gva, args.pool_bytes, args.device, args.ready_timeout)
         _request_source_staging(args.head_ip, args.control_port, args.control_timeout)
@@ -612,17 +796,20 @@ def _run_rank1(args: argparse.Namespace, dtype: torch.dtype) -> None:
                 )
                 _assert_equal(dst, expected, f"topk={topk} {method}")
                 results.append(BenchResult(topk, total_bytes, method, avg_us, bandwidth_gbs))
+
+        dense_results = _run_dense_copy_benchmark(handle, dense_gva, args, dtype)
     finally:
         _cleanup(handle, bm_inited, joined)
 
     _print_results(results, args.dtype, args.iters)
-    if any(row.error is not None for row in results):
+    _print_dense_results(dense_results, args.dtype, args.iters)
+    if any(row.error is not None for row in (*results, *dense_results)):
         print(
             "[rank 1] benchmark completed; supported paths were verified and unavailable paths are marked N/A",
             flush=True,
         )
     else:
-        print("[rank 1] all sparse-copy measurements and verifications passed", flush=True)
+        print("[rank 1] all sparse and dense-copy measurements and verifications passed", flush=True)
 
 
 def _print_results(results: list[BenchResult], dtype_name: str, iters: int) -> None:
@@ -647,6 +834,28 @@ def _print_results(results: list[BenchResult], dtype_name: str, iters: int) -> N
         )
 
 
+def _print_dense_results(results: list[DenseBenchResult], dtype_name: str, iters: int) -> None:
+    print(
+        "\nremote DRAM dense 1 GiB single-copy benchmark "
+        f"(dtype={dtype_name}, timed iterations={iters}, all bytes verified)",
+        flush=True,
+    )
+    print(
+        f"{'bytes(GiB)':>12} {'method':<24} {'avg(us)':>12} {'BW(GB/s)':>12}  status",
+        flush=True,
+    )
+    print("-" * 112, flush=True)
+    for row in results:
+        avg_us = f"{row.avg_us:.2f}" if row.avg_us is not None else "N/A"
+        bandwidth_gbs = f"{row.bandwidth_gbs:.2f}" if row.bandwidth_gbs is not None else "N/A"
+        status = "OK" if row.error is None else f"N/A ({row.error})"
+        print(
+            f"{row.total_bytes / 2**30:>12.3f} {row.method:<24} "
+            f"{avg_us:>12} {bandwidth_gbs:>12}  {status}",
+            flush=True,
+        )
+
+
 def _parse_topks(value: str) -> tuple[int, ...]:
     topks = tuple(sorted(set(int(item.strip()) for item in value.split(",") if item.strip())))
     if not topks:
@@ -666,7 +875,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device-id", type=int, default=int(os.environ.get("LOCAL_RANK", "0")))
     parser.add_argument("--nic-url", default=DEFAULT_NIC_URL)
     parser.add_argument("--pool-id", type=int, default=0)
-    parser.add_argument("--pool-bytes", type=int, default=ONE_GIB)
+    parser.add_argument(
+        "--pool-bytes",
+        type=int,
+        default=DEFAULT_POOL_BYTES,
+        help=(
+            "per-rank DRAM contribution; defaults to 2 GiB to hold the 576 MiB sparse source, "
+            "the additional 1 GiB dense source, and the ready marker"
+        ),
+    )
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="bfloat16")
     parser.add_argument("--src-meta-device", choices=("cpu", "meta"), default="cpu")
     parser.add_argument(
