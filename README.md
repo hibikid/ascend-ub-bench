@@ -187,3 +187,7 @@ python3 microbench_sdma_mte.py --rank 1 --scales 64,2048 --url tcp://<rank0-ip>:
   之后才开测——rank0 起得慢会自动等它，rank0 完全没起则 `--ready-timeout`（默认 120s）超时明确报错。
   rank0 侧设计上不碰 peer GVA，不会因对端未就绪而失败。正常启动顺序仍是先 rank0、再 rank1；
 - 想换参数重跑：rank1 退出后，保持 rank0 的持有进程不动，重新起一个 rank1 即可（rank0 持有期间可反复跑）。
+
+## HBM 读取 QoS 实验
+
+[QoS benchmark 使用说明](QoS/README.md) 提供对端 HBM 上的 H/P 读取测试，沿用 SDMA/MTE 的 `copy_data` 调用分支，支持 E1/E2、E3 等字节量限速和 E4 S0/S1 对比。当前以多线程调用同步接口，K 表示未返回的主机调用数；实际设备重叠和直访路径需要独立 profiling 验证。运行入口为 `python3 QoS/qos_bench.py --help`。
